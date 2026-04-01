@@ -306,8 +306,8 @@ def parse_args():
 def main():
     args = parse_args()
 
-    input_dir = os.path.abspath(args.input_dir)
-    dataset_name = args.dataset_name or os.path.basename(input_dir)
+    input_dir = args.input_dir
+    dataset_name = args.dataset_name or os.path.basename(os.path.abspath(input_dir))
     output_dir = args.output_dir or input_dir
     dataset_root = os.path.join(output_dir, f"{dataset_name}_nit")
     vae_short_name = args.vae_model.split("/")[-1]
