@@ -73,6 +73,21 @@ Options:
 
 `num_classes` is set automatically from dataset labels. Adjust if fine-tuning from an ImageNet-pretrained checkpoint.
 
+#### Alternative: preprocess ImageNet1K locally
+
+Modify `data_dir` in the config, then encode and pack. Example for native resolution:
+```bash
+torchrun --nnodes 1 --nproc_per_node 8 --rdzv_id $RANDOM --rdzv_backend c10d \
+    --rdzv_endpoint localhost:$((30000 + $RANDOM % 21000)) \
+    projects/preprocess/image_nr_latent_c2i.py \
+    --config configs/preprocess/imagenet1k_native_resolution.yaml \
+    --project_dir workdir/preprocess/imagenet1k_native_resolution --seed 0
+
+python tools/pack_dataset.py
+```
+
+Other resolution configs: `configs/preprocess/imagenet1k_256x256.yaml`, `configs/preprocess/imagenet1k_512x512.yaml` (use `image_latent_c2i.py` instead of `image_nr_latent_c2i.py`).
+
 ### Step 4. Train
 
 ```bash
