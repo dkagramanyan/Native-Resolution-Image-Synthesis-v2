@@ -1,7 +1,10 @@
 import functools
 import importlib
 import os
-import wandb
+try:
+    import wandb
+except ImportError:
+    wandb = None
 import fsspec
 import numpy as np
 import torch
