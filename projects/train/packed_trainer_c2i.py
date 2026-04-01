@@ -325,10 +325,12 @@ def main(args):
     if accelerator.is_main_process and getattr(train_config, 'tracker', None) != None:
         tracker_project_name = project_dir.split('/')[-1]
         tracker_kwargs = getattr(train_config, 'tracker_kwargs', {})
+        # Convert OmegaConf to plain dict for tensorboard compatibility
+        config_dict = OmegaConf.to_container(config, resolve=True)
         if tracker_kwargs:
-            accelerator.init_trackers(tracker_project_name, config=config, init_kwargs=tracker_kwargs)
+            accelerator.init_trackers(tracker_project_name, config=config_dict, init_kwargs=tracker_kwargs)
         else:
-            accelerator.init_trackers(tracker_project_name, config=config)
+            accelerator.init_trackers(tracker_project_name, config=config_dict)
 
     
     # initialize GPU memory monitor before applying parallelisms to the model
