@@ -462,7 +462,9 @@ def main(args):
                 torch.cuda.empty_cache()
             
                 if global_steps % train_config.validation_steps == 0:
-                    log_validation(model)
+                    log_validation(
+                        model, accelerator, model_config, sample_dir, global_steps,
+                    )
             logs = {
                 # loss and lr
                 "loss_denoising": fm_loss.detach().item(), 
