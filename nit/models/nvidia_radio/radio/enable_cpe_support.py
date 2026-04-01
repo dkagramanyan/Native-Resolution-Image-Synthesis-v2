@@ -38,8 +38,9 @@ def _sdpa_varlen(q, k, v, cu_seqlens, max_seqlen):
     k_padded = torch.zeros_like(q_padded)
     v_padded = torch.zeros_like(q_padded)
 
+    cu = cu_seqlens.detach().cpu()
     for i in range(B):
-        s, e = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+        s, e = cu[i].item(), cu[i + 1].item()
         q_padded[i, :e - s] = q[s:e]
         k_padded[i, :e - s] = k[s:e]
         v_padded[i, :e - s] = v[s:e]
@@ -48,7 +49,7 @@ def _sdpa_varlen(q, k, v, cu_seqlens, max_seqlen):
     k_padded = k_padded.transpose(1, 2)
     v_padded = v_padded.transpose(1, 2)
 
-    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)
     attn_mask = (torch.arange(max_seqlen, device=device).unsqueeze(0) < seq_lens.unsqueeze(1))
     attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
 
@@ -57,7 +58,7 @@ def _sdpa_varlen(q, k, v, cu_seqlens, max_seqlen):
 
     results = []
     for i in range(B):
-        length = (cu_seqlens[i + 1] - cu_seqlens[i]).item()
+        length = cu[i + 1].item() - cu[i].item()
         results.append(out[i, :length])
     return torch.cat(results, dim=0).reshape(-1, num_heads * head_dim)
 

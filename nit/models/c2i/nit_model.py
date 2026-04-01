@@ -160,8 +160,9 @@ class Attention(nn.Module):
         k_padded = torch.zeros_like(q_padded)
         v_padded = torch.zeros_like(q_padded)
 
+        cu = cu_seqlens.detach().cpu()
         for i in range(B):
-            start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+            start, end = cu[i].item(), cu[i + 1].item()
             length = end - start
             q_padded[i, :length] = q[start:end]
             k_padded[i, :length] = k[start:end]
@@ -174,7 +175,7 @@ class Attention(nn.Module):
 
         # Build attention mask to ignore padding positions
         # (B, 1, 1, max_seqlen) - broadcastable over heads and query positions
-        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]  # (B,)
+        seq_lens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(device)  # (B,)
         mask = torch.arange(max_seqlen, device=device).unsqueeze(0) < seq_lens.unsqueeze(1)  # (B, max_seqlen)
         attn_mask = mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, max_seqlen)
 
@@ -186,7 +187,7 @@ class Attention(nn.Module):
         out = out.transpose(1, 2)  # (B, max_seqlen, num_heads, head_dim)
         results = []
         for i in range(B):
-            length = (cu_seqlens[i + 1] - cu_seqlens[i]).item()
+            length = cu[i + 1].item() - cu[i].item()
             results.append(out[i, :length])
         x = torch.cat(results, dim=0)  # (N_total, num_heads, head_dim)
         return x.reshape(x.shape[0], -1)  # (N_total, num_heads * head_dim)
