@@ -76,22 +76,19 @@ Options:
 ### Step 4. Train
 
 ```bash
-accelerate launch projects/train/packed_trainer_c2i.py \
+torchrun \
+    --nnodes 1 \
+    --nproc_per_node 8 \
+    --rdzv_id $RANDOM \
+    --rdzv_backend c10d \
+    --rdzv_endpoint localhost:60563 \
+    projects/train/packed_trainer_c2i.py \
     --config datasets/imagenet_9to4_nit/train_config.yaml \
-    --project_dir workdir/imagenet_9to4
+    --project_dir workdir/imagenet_9to4 \
+    --seed 0
 ```
 
-Checkpoints are saved to `workdir/imagenet_9to4/checkpoints/`.
-
-Available model configs (for ImageNet1K with preprocessed data):
-
-| Model | Size | Config | Script |
-|-------|------|--------|--------|
-| NiT-S | 33M | `configs/c2i/nit_s_pack_merge_radio_65536.yaml` | `bash scripts/train/train_s_model.sh` |
-| NiT-B | 131M | `configs/c2i/nit_b_pack_merge_radio_65536.yaml` | `bash scripts/train/train_b_model.sh` |
-| NiT-L | 457M | `configs/c2i/nit_l_pack_merge_radio_16384.yaml` | `bash scripts/train/train_l_model.sh` |
-| NiT-XL | 675M | `configs/c2i/nit_xl_pack_merge_radio_16384.yaml` | `bash scripts/train/train_xl_model.sh` |
-| NiT-XXL | 1.37B | `configs/c2i/nit_xxl_pack_merge_radio_8192.yaml` | `bash scripts/train/train_xxl_model.sh` |
+Adjust `--nproc_per_node` to match your number of GPUs. Checkpoints are saved to `workdir/imagenet_9to4/checkpoints/`.
 
 
 ## Sampling (step by step)
