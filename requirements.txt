@@ -12,5 +12,6 @@ timm
 safetensors
 einops
 omegaconf
+tensorboard
 triton
 torchdiffeq

@@ -322,10 +322,13 @@ def main(args):
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
-    if accelerator.is_main_process and getattr(train_config, 'tracker', 'wandb') != None:
+    if accelerator.is_main_process and getattr(train_config, 'tracker', None) != None:
         tracker_project_name = project_dir.split('/')[-1]
-        # accelerator.init_trackers("mcga", config=config, init_kwargs=train_config.tracker_kwargs)
-        accelerator.init_trackers(tracker_project_name, config=config, init_kwargs=train_config.tracker_kwargs)
+        tracker_kwargs = getattr(train_config, 'tracker_kwargs', {})
+        if tracker_kwargs:
+            accelerator.init_trackers(tracker_project_name, config=config, init_kwargs=tracker_kwargs)
+        else:
+            accelerator.init_trackers(tracker_project_name, config=config)
 
     
     # initialize GPU memory monitor before applying parallelisms to the model

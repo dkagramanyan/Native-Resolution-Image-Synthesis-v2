@@ -45,10 +45,7 @@ data:
     batch_size: 1
 
 training:
-  tracker: null
-  tracker_kwargs:
-    wandb:
-      group: c2i
+  tracker: tensorboard
   max_train_steps: 1000000
   checkpointing_steps: 2000
   checkpoints_total_limit: 2
