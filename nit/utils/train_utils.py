@@ -48,9 +48,10 @@ def update_ema(ema_model, model, decay=0.9999):
 @torch.no_grad()
 def log_validation(
     model, accelerator, model_config, sample_dir, global_steps,
-    num_samples_per_class=4, image_size=256, num_steps=50, cfg_scale=1.5,
+    num_samples_per_class=4, image_sizes=(256, 512, 1024),
+    num_steps=50, cfg_scale=1.5,
 ):
-    """Generate and save sample images during training.
+    """Generate and save sample images at multiple resolutions during training.
 
     Args:
         model: the NiT model (accelerator-wrapped)
@@ -58,12 +59,11 @@ def log_validation(
         model_config: model config from OmegaConf
         sample_dir: directory to save generated images
         global_steps: current training step
-        num_samples_per_class: number of images to generate per class
-        image_size: output image resolution (square)
+        num_samples_per_class: number of images to generate per class per resolution
+        image_sizes: tuple of output resolutions to generate
         num_steps: number of ODE sampling steps
         cfg_scale: classifier-free guidance scale
     """
-    from nit.schedulers.flow_matching.samplers_c2i import euler_sampler
     from nit.utils.model_utils import dc_ae_decode
     from diffusers import AutoencoderDC
     from PIL import Image
@@ -82,89 +82,79 @@ def log_validation(
     patch_size = model_config.network.params.patch_size
     spatial_downsample = 32  # DC-AE
 
-    latent_h = image_size // spatial_downsample
-    latent_w = image_size // spatial_downsample
-
     # Load VAE for decoding (only when needed, then discard to save memory)
     vae = AutoencoderDC.from_pretrained(model_config.vae_dir).to(device, dtype=torch.float32)
     vae.eval()
 
-    # Monkey-patch the sampler's null class index to match our num_classes
-    # The sampler hardcodes y_null=1000, but for num_classes=3 the null token is index 3
-    _original_euler = euler_sampler.__code__
-
     step_dir = os.path.join(sample_dir, f"step_{global_steps:07d}")
     os.makedirs(step_dir, exist_ok=True)
 
-    all_images = []
+    total_saved = 0
 
-    for class_idx in range(num_classes):
-        n = num_samples_per_class
+    for image_size in image_sizes:
+        latent_h = image_size // spatial_downsample
+        latent_w = image_size // spatial_downsample
+        res_label = f"{image_size}x{image_size}"
+        res_dir = os.path.join(step_dir, res_label)
+        os.makedirs(res_dir, exist_ok=True)
 
-        # Random latent noise
-        z = torch.randn(
-            n * latent_h * latent_w, unwrapped_model.in_channels, patch_size, patch_size,
-            device=device, dtype=dtype
-        )
+        all_images = []
 
-        # Class labels
-        y = torch.full((n,), class_idx, device=device, dtype=torch.long)
+        for class_idx in range(num_classes):
+            n = num_samples_per_class
 
-        # Spatial dimensions
-        hw_list = torch.tensor(
-            [[latent_h, latent_w]] * n, device=device, dtype=torch.int
-        )
+            # Random latent noise
+            z = torch.randn(
+                n * latent_h * latent_w, unwrapped_model.in_channels, patch_size, patch_size,
+                device=device, dtype=dtype
+            )
 
-        # Run ODE sampler with CFG
-        # Need to temporarily set null class to num_classes for proper CFG
-        y_null = torch.full((n,), num_classes, device=device, dtype=torch.long)
-        samples = _euler_sampler_with_null(
-            unwrapped_model, z, y, y_null, hw_list,
-            num_steps=num_steps, cfg_scale=cfg_scale, dtype=dtype,
-        )
+            # Class labels
+            y = torch.full((n,), class_idx, device=device, dtype=torch.long)
 
-        # Reshape from packed to spatial
-        samples = rearrange(
-            samples.to(torch.float32),
-            '(b h w) c p1 p2 -> b c (h p1) (w p2)',
-            b=n, h=latent_h, w=latent_w,
-        )
+            # Spatial dimensions
+            hw_list = torch.tensor(
+                [[latent_h, latent_w]] * n, device=device, dtype=torch.int
+            )
 
-        # Decode with VAE
-        images = dc_ae_decode(vae, samples)
-        images = ((images + 1) / 2.0 * 255).clamp(0, 255).to(torch.uint8)
-        images = images.permute(0, 2, 3, 1).cpu().numpy()
+            # Null class for CFG
+            y_null = torch.full((n,), num_classes, device=device, dtype=torch.long)
+            samples = _euler_sampler_with_null(
+                unwrapped_model, z, y, y_null, hw_list,
+                num_steps=num_steps, cfg_scale=cfg_scale, dtype=dtype,
+            )
 
-        for i, img in enumerate(images):
-            pil_img = Image.fromarray(img)
-            pil_img.save(os.path.join(step_dir, f"class{class_idx:02d}_{i:02d}.png"))
-            all_images.append(img)
+            # Reshape from packed to spatial
+            samples = rearrange(
+                samples.to(torch.float32),
+                '(b h w) c p1 p2 -> b c (h p1) (w p2)',
+                b=n, h=latent_h, w=latent_w,
+            )
 
-    # Save grid image
-    _save_grid(all_images, num_classes, num_samples_per_class, step_dir)
+            # Decode with VAE
+            images = dc_ae_decode(vae, samples)
+            images = ((images + 1) / 2.0 * 255).clamp(0, 255).to(torch.uint8)
+            images = images.permute(0, 2, 3, 1).cpu().numpy()
+
+            for i, img in enumerate(images):
+                pil_img = Image.fromarray(img)
+                pil_img.save(os.path.join(res_dir, f"class{class_idx:02d}_{i:02d}.png"))
+                all_images.append(img)
+                total_saved += 1
+
+        # Save grid per resolution
+        _save_grid(all_images, num_classes, num_samples_per_class,
+                   os.path.join(step_dir, f"grid_{res_label}.png"))
 
     # Cleanup VAE to free GPU memory
     del vae
     torch.cuda.empty_cache()
 
-    # Log to tensorboard if available
-    try:
-        grid_path = os.path.join(step_dir, "grid.png")
-        if os.path.exists(grid_path):
-            from PIL import Image as PILImage
-            import numpy as np
-            grid_img = np.array(PILImage.open(grid_path))
-            # HWC -> CHW for tensorboard
-            grid_tensor = torch.from_numpy(grid_img).permute(2, 0, 1)
-            accelerator.log({"samples": [grid_tensor]}, step=global_steps)
-    except Exception:
-        pass  # tensorboard image logging is best-effort
-
     # Restore training mode
     if was_training:
         unwrapped_model.train()
 
-    logger.info(f"Saved {len(all_images)} validation images to {step_dir}")
+    logger.info(f"Saved {total_saved} validation images to {step_dir}")
 
 
 def _euler_sampler_with_null(model, latents, y, y_null, hw_list,
@@ -201,7 +191,7 @@ def _euler_sampler_with_null(model, latents, y, y_null, hw_list,
     return x_next
 
 
-def _save_grid(images, num_classes, num_per_class, save_dir):
+def _save_grid(images, num_classes, num_per_class, save_path):
     """Save a grid of images: rows=classes, cols=samples."""
     from PIL import Image as PILImage
     import numpy as np
@@ -217,4 +207,4 @@ def _save_grid(images, num_classes, num_per_class, save_dir):
         col = idx % num_per_class
         grid[row * h:(row + 1) * h, col * w:(col + 1) * w] = img
 
-    PILImage.fromarray(grid).save(os.path.join(save_dir, "grid.png"))
+    PILImage.fromarray(grid).save(save_path)
