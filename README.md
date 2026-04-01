@@ -13,12 +13,17 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-### Step 2. Download RADIO image encoder (for REPA loss)
+### Step 2. Check environment and download models
 
 ```bash
-mkdir -p checkpoints
-wget -c "https://huggingface.co/nvidia/RADIO/resolve/main/radio_v2.5-h.pth.tar" -O checkpoints/radio_v2.5-h.pth.tar
+python check_environment.py
 ```
+
+This checks all Python packages, verifies GPU availability, and automatically downloads missing models:
+- **DC-AE VAE** (`mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers`) — for encoding images to latents
+- **RADIO v2.5-h** — image encoder for REPA loss during training
+
+Run with `--no-download` to only check without downloading.
 
 ### Step 3. Preprocess dataset
 
@@ -72,21 +77,6 @@ Options:
 - `--skip-packing` — only encode latents, skip packing step
 
 `num_classes` is set automatically from dataset labels. Adjust if fine-tuning from an ImageNet-pretrained checkpoint.
-
-#### Alternative: preprocess ImageNet1K locally
-
-Modify `data_dir` in the config, then encode and pack. Example for native resolution:
-```bash
-torchrun --nnodes 1 --nproc_per_node 8 --rdzv_id $RANDOM --rdzv_backend c10d \
-    --rdzv_endpoint localhost:$((30000 + $RANDOM % 21000)) \
-    projects/preprocess/image_nr_latent_c2i.py \
-    --config configs/preprocess/imagenet1k_native_resolution.yaml \
-    --project_dir workdir/preprocess/imagenet1k_native_resolution --seed 0
-
-python tools/pack_dataset.py
-```
-
-Other resolution configs: `configs/preprocess/imagenet1k_256x256.yaml`, `configs/preprocess/imagenet1k_512x512.yaml` (use `image_latent_c2i.py` instead of `image_nr_latent_c2i.py`).
 
 ### Step 4. Train
 
