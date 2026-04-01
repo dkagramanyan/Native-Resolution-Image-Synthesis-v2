@@ -8,8 +8,9 @@
 ```bash
 conda create -n nit_env python=3.10
 pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu118
-pip install flash-attn
 pip install -r requirements.txt
+# Optional: install flash-attn for faster attention (falls back to PyTorch SDPA if not installed)
+# pip install flash-attn --no-build-isolation
 pip install -e .
 ```
 

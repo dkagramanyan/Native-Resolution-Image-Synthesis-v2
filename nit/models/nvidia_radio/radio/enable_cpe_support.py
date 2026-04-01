@@ -21,7 +21,45 @@ from .extra_models import DinoWrapper
 from .vit_patch_generator import ViTPatchGenerator
 from .forward_intermediates import forward_intermediates
 from .dual_hybrid_vit import HybridModel
-from flash_attn import flash_attn_varlen_func
+try:
+    from flash_attn import flash_attn_varlen_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
+
+
+def _sdpa_varlen(q, k, v, cu_seqlens, max_seqlen):
+    """Variable-length attention using PyTorch's scaled_dot_product_attention."""
+    B = cu_seqlens.shape[0] - 1
+    num_heads, head_dim = q.shape[1], q.shape[2]
+    device, dtype = q.device, q.dtype
+
+    q_padded = torch.zeros(B, max_seqlen, num_heads, head_dim, device=device, dtype=dtype)
+    k_padded = torch.zeros_like(q_padded)
+    v_padded = torch.zeros_like(q_padded)
+
+    for i in range(B):
+        s, e = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+        q_padded[i, :e - s] = q[s:e]
+        k_padded[i, :e - s] = k[s:e]
+        v_padded[i, :e - s] = v[s:e]
+
+    q_padded = q_padded.transpose(1, 2)
+    k_padded = k_padded.transpose(1, 2)
+    v_padded = v_padded.transpose(1, 2)
+
+    seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
+    attn_mask = (torch.arange(max_seqlen, device=device).unsqueeze(0) < seq_lens.unsqueeze(1))
+    attn_mask = attn_mask.unsqueeze(1).unsqueeze(2)
+
+    out = torch.nn.functional.scaled_dot_product_attention(q_padded, k_padded, v_padded, attn_mask=attn_mask)
+    out = out.transpose(1, 2)
+
+    results = []
+    for i in range(B):
+        length = (cu_seqlens[i + 1] - cu_seqlens[i]).item()
+        results.append(out[i, :length])
+    return torch.cat(results, dim=0).reshape(-1, num_heads * head_dim)
 
 
 def _attn_forward_pack(self: Attention, x: torch.Tensor, cu_seqlens: torch.Tensor) -> torch.Tensor:
@@ -31,9 +69,12 @@ def _attn_forward_pack(self: Attention, x: torch.Tensor, cu_seqlens: torch.Tenso
     q, k = self.q_norm(q), self.k_norm(k)
     max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
-    x = flash_attn_varlen_func(
-        q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen
-    ).reshape(N, -1)
+    if HAS_FLASH_ATTN:
+        x = flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen
+        ).reshape(N, -1)
+    else:
+        x = _sdpa_varlen(q, k, v, cu_seqlens, max_seqlen)
 
     x = self.proj(x)
     x = self.proj_drop(x)

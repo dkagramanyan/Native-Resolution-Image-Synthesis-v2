@@ -8,7 +8,11 @@ import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Mlp
 from einops import rearrange, repeat
-from flash_attn import flash_attn_varlen_func
+try:
+    from flash_attn import flash_attn_varlen_func
+    HAS_FLASH_ATTN = True
+except ImportError:
+    HAS_FLASH_ATTN = False
 from nit.models.utils.funcs import get_parameter_dtype
 from nit.models.utils.pos_embeds.rope import VisionRotaryEmbedding, rotate_half
 from typing import Optional
@@ -118,20 +122,74 @@ class Attention(nn.Module):
         ori_dtype = qkv.dtype
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
-        
+
         q = q * freqs_cos + rotate_half(q) * freqs_sin
         k = k * freqs_cos + rotate_half(k) * freqs_sin
         q, k = q.to(ori_dtype), k.to(ori_dtype)
-        
+
         max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
-        x = flash_attn_varlen_func(
-            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen
-        ).reshape(N, -1)
+        if HAS_FLASH_ATTN:
+            x = flash_attn_varlen_func(
+                q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen
+            ).reshape(N, -1)
+        else:
+            x = self._sdpa_varlen(q, k, v, cu_seqlens, max_seqlen)
 
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
+
+    @staticmethod
+    def _sdpa_varlen(q, k, v, cu_seqlens, max_seqlen):
+        """Variable-length attention using PyTorch's scaled_dot_product_attention.
+        Pads sequences into a batch, applies causal-free SDPA with attention mask,
+        then unpads back to the packed format.
+
+        q, k, v: (N_total, num_heads, head_dim)
+        cu_seqlens: (B+1,) cumulative sequence lengths
+        """
+        B = cu_seqlens.shape[0] - 1
+        num_heads = q.shape[1]
+        head_dim = q.shape[2]
+        device = q.device
+        dtype = q.dtype
+
+        # Pad into (B, max_seqlen, num_heads, head_dim)
+        q_padded = torch.zeros(B, max_seqlen, num_heads, head_dim, device=device, dtype=dtype)
+        k_padded = torch.zeros_like(q_padded)
+        v_padded = torch.zeros_like(q_padded)
+
+        for i in range(B):
+            start, end = cu_seqlens[i].item(), cu_seqlens[i + 1].item()
+            length = end - start
+            q_padded[i, :length] = q[start:end]
+            k_padded[i, :length] = k[start:end]
+            v_padded[i, :length] = v[start:end]
+
+        # Reshape to (B, num_heads, max_seqlen, head_dim) for SDPA
+        q_padded = q_padded.transpose(1, 2)
+        k_padded = k_padded.transpose(1, 2)
+        v_padded = v_padded.transpose(1, 2)
+
+        # Build attention mask to ignore padding positions
+        # (B, 1, 1, max_seqlen) - broadcastable over heads and query positions
+        seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]  # (B,)
+        mask = torch.arange(max_seqlen, device=device).unsqueeze(0) < seq_lens.unsqueeze(1)  # (B, max_seqlen)
+        attn_mask = mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, max_seqlen)
+
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q_padded, k_padded, v_padded, attn_mask=attn_mask
+        )  # (B, num_heads, max_seqlen, head_dim)
+
+        # Unpad back to packed format
+        out = out.transpose(1, 2)  # (B, max_seqlen, num_heads, head_dim)
+        results = []
+        for i in range(B):
+            length = (cu_seqlens[i + 1] - cu_seqlens[i]).item()
+            results.append(out[i, :length])
+        x = torch.cat(results, dim=0)  # (N_total, num_heads, head_dim)
+        return x.reshape(x.shape[0], -1)  # (N_total, num_heads * head_dim)
 
 
 

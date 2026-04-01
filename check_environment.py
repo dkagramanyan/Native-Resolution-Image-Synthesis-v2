@@ -18,7 +18,6 @@ import subprocess
 REQUIRED_PACKAGES = [
     ("torch", "torch", "core"),
     ("torchvision", "torchvision", "core"),
-    ("flash_attn", "flash-attn", "core"),
     ("accelerate", "accelerate", "training"),
     ("diffusers", "diffusers", "preprocessing + training"),
     ("transformers", "transformers", "training"),
@@ -64,12 +63,12 @@ def check_packages():
             print(f"  [MISS] {pip_name:<20s} {'—':<15s} ({required_for})")
             missing.append(pip_name)
 
-    # Check flash_attn submodule specifically
+    # Check flash_attn (optional — PyTorch SDPA fallback is available)
     try:
         from flash_attn import flash_attn_varlen_func
-        print(f"  [OK]   {'flash_attn_varlen_func':<20s} {'available':<15s} (variable-length attention)")
+        print(f"  [OK]   {'flash-attn (optional)':<20s} {'available':<15s} (faster attention)")
     except ImportError:
-        print(f"  [WARN] {'flash_attn_varlen_func':<20s} {'—':<15s} (may need flash-attn reinstall)")
+        print(f"  [INFO] {'flash-attn (optional)':<20s} {'—':<15s} (using PyTorch SDPA fallback)")
 
     print()
     if missing:
