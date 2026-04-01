@@ -81,7 +81,7 @@ Options:
 
 ### Step 4. Train
 
-Trains NiT-XXL (1.37B params) with AdaLN-LoRA, max sequence length 8192:
+Trains NiT-XL (675M params) with gradient checkpointing (fits on 24GB GPU):
 
 ```bash
 torchrun \
