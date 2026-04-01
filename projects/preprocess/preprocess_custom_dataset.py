@@ -26,6 +26,7 @@ Usage:
 """
 
 import os
+import sys
 import io
 import json
 import math
@@ -36,6 +37,11 @@ import glob
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+# Ensure nit package is importable even without pip install -e .
+_project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
 from PIL import Image
 from tqdm import tqdm
@@ -144,39 +150,56 @@ def process_resolution(
     ])
 
     meta_entries = []
+    skipped = 0
+    encoded = 0
     zf = zipfile.ZipFile(zip_path, 'r')
 
     for img_name, class_label in tqdm(labels, desc=f"Encoding {data_type}"):
-        pil_image = Image.open(io.BytesIO(zf.read(img_name))).convert("RGB")
-        ori_w, ori_h = pil_image.size
-
-        # Resize
-        pil_image = resize_fn(pil_image)
-        resized_w, resized_h = pil_image.size
-
-        # Normalize to tensor [-1, 1]
-        img_tensor = normalize(pil_image).unsqueeze(0).to(device, dtype=torch.float32)
-        img_hflip = hflip(img_tensor)
-
-        # Encode through VAE
-        z_ori = dc_ae_encode(dc_ae, img_tensor)
-        z_hflip = dc_ae_encode(dc_ae, img_hflip)
-        z = torch.stack([z_ori.squeeze(0), z_hflip.squeeze(0)], dim=0).cpu()
-
-        # Determine output path: class_XXXXX/img_name.safetensors
         class_folder = f"class_{class_label:05d}"
         base_name = os.path.splitext(os.path.basename(img_name))[0]
         out_folder = os.path.join(output_latent_dir, class_folder)
-        os.makedirs(out_folder, exist_ok=True)
         out_path = os.path.join(out_folder, f"{base_name}.safetensors")
 
-        save_file(
-            {"latent": z.contiguous(), "label": torch.tensor(class_label)},
-            out_path
-        )
+        if os.path.exists(out_path):
+            # Already encoded — read dimensions from the file to build metadata
+            from safetensors.torch import load_file as _load_file
+            data = _load_file(out_path)
+            latent = data['latent']
+            _, _, lh, lw = latent.shape  # [2, C, H, W]
+            latent_h = lh
+            latent_w = lw
+            resized_h = latent_h * vae_downsample_factor
+            resized_w = latent_w * vae_downsample_factor
+            # Get original dims by opening image (only needed for metadata)
+            pil_image = Image.open(io.BytesIO(zf.read(img_name)))
+            ori_w, ori_h = pil_image.size
+            skipped += 1
+        else:
+            pil_image = Image.open(io.BytesIO(zf.read(img_name))).convert("RGB")
+            ori_w, ori_h = pil_image.size
 
-        latent_h = resized_h // vae_downsample_factor
-        latent_w = resized_w // vae_downsample_factor
+            # Resize
+            pil_image = resize_fn(pil_image)
+            resized_w, resized_h = pil_image.size
+
+            # Normalize to tensor [-1, 1]
+            img_tensor = normalize(pil_image).unsqueeze(0).to(device, dtype=torch.float32)
+            img_hflip = hflip(img_tensor)
+
+            # Encode through VAE
+            z_ori = dc_ae_encode(dc_ae, img_tensor)
+            z_hflip = dc_ae_encode(dc_ae, img_hflip)
+            z = torch.stack([z_ori.squeeze(0), z_hflip.squeeze(0)], dim=0).cpu()
+
+            os.makedirs(out_folder, exist_ok=True)
+            save_file(
+                {"latent": z.contiguous(), "label": torch.tensor(class_label)},
+                out_path
+            )
+
+            latent_h = resized_h // vae_downsample_factor
+            latent_w = resized_w // vae_downsample_factor
+            encoded += 1
 
         latent_rel = f"{class_folder}/{base_name}.safetensors"
         image_rel = img_name
@@ -194,6 +217,8 @@ def process_resolution(
         })
 
     zf.close()
+    if skipped > 0:
+        print(f"  Skipped {skipped} already-encoded files, encoded {encoded} new files.")
     return meta_entries
 
 
@@ -298,12 +323,6 @@ def main():
     print(f"Dataset: {len(labels)} images, {num_classes} classes, "
           f"label range: {min(l[1] for l in labels)}-{max(l[1] for l in labels)}")
 
-    # Load VAE
-    print(f"\nLoading VAE: {args.vae_model}")
-    dc_ae = AutoencoderDC.from_pretrained(args.vae_model).to(args.device, dtype=torch.float32)
-    dc_ae.eval()
-    dc_ae.requires_grad_(False)
-
     all_meta_entries = []
     data_types_used = []
     latent_dirs_used = []
@@ -313,42 +332,60 @@ def main():
     # Any additional zips are treated as fixed-resolution variants.
     native_zip_path, native_res = zip_list[0]
 
-    # --- Native resolution ---
-    nr_latent_dir = os.path.join(dataset_root, f"{vae_short_name}-native-resolution")
-    nr_resize = functools.partial(
-        native_resolution_resize,
-        min_image_size=args.min_image_size,
-        max_image_size=args.max_image_size,
-    )
-    print(f"\n=== Processing native-resolution (from {native_res[0]}x{native_res[1]} source) ===")
-    nr_meta = process_resolution(
-        labels, native_zip_path, dc_ae, args.device,
-        nr_latent_dir, nr_resize, "native-resolution",
-    )
-    all_meta_entries.extend(nr_meta)
-    data_types_used.append("native-resolution")
-    latent_dirs_used.append(nr_latent_dir)
-    write_jsonl(nr_meta, os.path.join(meta_dir, f"{vae_short_name}_nr_meta.jsonl"))
-
-    # --- Fixed-resolution variants from remaining zips ---
+    # Build list of all resolutions to process
+    resolutions_to_process = [
+        (native_zip_path, native_res, "native-resolution",
+         os.path.join(dataset_root, f"{vae_short_name}-native-resolution"),
+         functools.partial(native_resolution_resize,
+                           min_image_size=args.min_image_size,
+                           max_image_size=args.max_image_size)),
+    ]
     for zip_path, (w, h) in zip_list[1:]:
         if w != h:
-            print(f"\nSkipping {os.path.basename(zip_path)}: non-square ({w}x{h}), "
-                  f"only square fixed-resolution variants are supported")
+            print(f"Skipping {os.path.basename(zip_path)}: non-square ({w}x{h})")
             continue
         res = w
-        data_type = f"fixed-{res}x{res}"
-        latent_dir = os.path.join(dataset_root, f"{vae_short_name}-{res}x{res}")
-        resize_fn = functools.partial(center_crop_resize, image_size=res)
-        print(f"\n=== Processing {data_type} (from {os.path.basename(zip_path)}) ===")
+        resolutions_to_process.append((
+            zip_path, (w, h), f"fixed-{res}x{res}",
+            os.path.join(dataset_root, f"{vae_short_name}-{res}x{res}"),
+            functools.partial(center_crop_resize, image_size=res),
+        ))
+
+    # Check if any encoding work is needed (to avoid loading VAE unnecessarily)
+    encoding_needed = False
+    for zp, res, data_type, latent_dir, resize_fn in resolutions_to_process:
+        sample_label = labels[0]
+        class_folder = f"class_{sample_label[1]:05d}"
+        base_name = os.path.splitext(os.path.basename(sample_label[0]))[0]
+        sample_path = os.path.join(latent_dir, class_folder, f"{base_name}.safetensors")
+        if not os.path.exists(sample_path):
+            encoding_needed = True
+            break
+
+    # Load VAE only if encoding is needed
+    if encoding_needed:
+        print(f"\nLoading VAE: {args.vae_model}")
+        dc_ae = AutoencoderDC.from_pretrained(args.vae_model).to(args.device, dtype=torch.float32)
+        dc_ae.eval()
+        dc_ae.requires_grad_(False)
+    else:
+        print("\nAll latent files already exist, skipping VAE loading.")
+        dc_ae = None
+
+    # --- Process each resolution ---
+    for zp, res, data_type, latent_dir, resize_fn in resolutions_to_process:
+        meta_suffix = "nr" if data_type == "native-resolution" else f"{res[0]}x{res[1]}"
+        meta_path = os.path.join(meta_dir, f"{vae_short_name}_{meta_suffix}_meta.jsonl")
+
+        print(f"\n=== Processing {data_type} (from {res[0]}x{res[1]} source) ===")
         meta = process_resolution(
-            labels, zip_path, dc_ae, args.device,
+            labels, zp, dc_ae, args.device,
             latent_dir, resize_fn, data_type,
         )
         all_meta_entries.extend(meta)
         data_types_used.append(data_type)
         latent_dirs_used.append(latent_dir)
-        write_jsonl(meta, os.path.join(meta_dir, f"{vae_short_name}_{res}x{res}_meta.jsonl"))
+        write_jsonl(meta, meta_path)
 
     # --- Merged meta ---
     merged_meta_path = os.path.join(meta_dir, f"{vae_short_name}_merge_meta.jsonl")
