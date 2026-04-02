@@ -460,10 +460,10 @@ def main():
                     data_type = entry['type']
 
                     if data_type == 'native-resolution':
-                        pil_image = native_resolution_resize(
-                            Image.open(image_file).convert("RGB"),
-                            min_image_size=self.min_image_size,
-                            max_image_size=self.max_image_size)
+                        # Resize to exact latent_h*16 x latent_w*16 so RADIO
+                        # token count matches model latent token count
+                        pil_image = Image.open(image_file).convert("RGB").resize(
+                            (width, height), resample=Image.Resampling.BICUBIC)
                     else:
                         pil_image = center_crop_resize(
                             Image.open(image_file).convert("RGB"),
