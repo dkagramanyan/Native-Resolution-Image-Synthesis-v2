@@ -41,7 +41,12 @@ def update_ema(ema_model, model, decay=0.9999):
     model_params = OrderedDict(model.named_parameters())
 
     for name, param in model_params.items():
-        ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
+        # Handle torch.compile() _orig_mod. prefix mismatch
+        ema_name = name.replace('_orig_mod.', '')
+        if ema_name in ema_params:
+            ema_params[ema_name].mul_(decay).add_(param.data, alpha=1 - decay)
+        elif name in ema_params:
+            ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 
 @torch.no_grad()
