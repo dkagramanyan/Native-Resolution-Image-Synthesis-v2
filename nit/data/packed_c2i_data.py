@@ -172,7 +172,8 @@ class C2ILoader():
         )
         if self.data_type == 'improved_pack':
             batch_sampler = get_packed_batch_sampler(
-                self.train_dataset.packed_dataset, rank, world_size, max_steps, resume_steps, seed
+                self.train_dataset.packed_dataset, rank, world_size, max_steps, resume_steps, seed,
+                batch_size=self.batch_size
             )
             return DataLoader(
                 self.train_dataset,

@@ -45,7 +45,7 @@ data:
     radio_feature_dir: datasets/imagenet_9to4_nit/radio-features
   dataloader:
     num_workers: 8
-    batch_size: 1
+    batch_size: 2
 
 training:
   tracker: tensorboard
@@ -58,7 +58,7 @@ training:
   scale_lr: true
   lr_scheduler: constant
   lr_warmup_steps: 0
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
   optimizer:
     target: torch.optim.AdamW
     params:

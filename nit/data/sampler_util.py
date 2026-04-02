@@ -28,9 +28,13 @@ def get_train_sampler(dataset, rank, world_size, global_batch_size, max_steps,
 
 
 def get_packed_batch_sampler(
-        dataset, rank, world_size, max_steps, resume_step, seed
+        dataset, rank, world_size, max_steps, resume_step, seed,
+        batch_size=1
     ):
-    sample_indices = [None for _ in range(max_steps)]
+    # Each entry in dataset is a list of image indices (one packed group).
+    # We first build single-pack steps, then merge `batch_size` packs into one step.
+    total_single_steps = max_steps * batch_size
+    sample_indices = [None for _ in range(total_single_steps)]
     epoch_id, fill_ptr, offs = 0, 0, 0
     while fill_ptr < len(sample_indices):
         g = torch.Generator()
@@ -48,5 +52,12 @@ def get_packed_batch_sampler(
             dataset[i] for i in epoch_sample_indices
         ]
         fill_ptr += epoch_sample_indices.size(0)
-    return sample_indices[resume_step:]
+    # Merge batch_size consecutive packs into one batch
+    merged = []
+    for i in range(0, total_single_steps, batch_size):
+        combined = []
+        for j in range(batch_size):
+            combined.extend(sample_indices[i + j])
+        merged.append(combined)
+    return merged[resume_step:]
 
