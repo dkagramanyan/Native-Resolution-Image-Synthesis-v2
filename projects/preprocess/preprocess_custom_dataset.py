@@ -88,6 +88,47 @@ def dc_ae_encode(dc_ae, images):
     return latents
 
 
+class RadioPreprocessDataset(torch.utils.data.Dataset):
+    """Dataset for CPU-side image loading/preprocessing for RADIO features.
+    Defined at module level so it can be pickled by spawn workers."""
+
+    def __init__(self, entries, image_dir, min_image_size, max_image_size):
+        self.entries = entries
+        self.image_dir = image_dir
+        self.min_image_size = min_image_size
+        self.max_image_size = max_image_size
+        self.to_tensor = transforms.ToTensor()
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __getitem__(self, idx):
+        entry = self.entries[idx]
+        image_file = os.path.join(self.image_dir, entry['image_file'])
+        height = entry['latent_h'] * 16
+        width = entry['latent_w'] * 16
+        data_type = entry['type']
+
+        pil_image = Image.open(image_file).convert("RGB")
+        if data_type == 'native-resolution':
+            # Resize to exact latent_h*16 x latent_w*16 so RADIO
+            # token count matches model latent token count
+            pil_image = pil_image.resize(
+                (width, height), resample=Image.Resampling.BICUBIC)
+        else:
+            pil_image = center_crop_resize(pil_image, image_size=height)
+
+        img_ori = self.to_tensor(pil_image)
+        img_flip = self.to_tensor(hflip(pil_image))
+        return idx, img_ori, img_flip
+
+
+def radio_collate_fn(batch):
+    """Collate that keeps variable-sized tensors as lists."""
+    idxs, oris, flips = zip(*batch)
+    return list(idxs), list(oris), list(flips)
+
+
 def discover_zips(input_dir):
     """Find all zip files in input_dir and detect their image resolution.
 
@@ -440,44 +481,6 @@ def main():
             print(f"  Processing {len(pending_entries)} entries on {num_gpus} GPU(s), "
                   f"batch_size={RADIO_BATCH_SIZE}")
 
-            # Dataset that does CPU-heavy image loading/preprocessing in workers
-            class _RadioPreprocessDataset(_Dataset):
-                def __init__(self, entries, image_dir, min_image_size, max_image_size):
-                    self.entries = entries
-                    self.image_dir = image_dir
-                    self.min_image_size = min_image_size
-                    self.max_image_size = max_image_size
-                    self.to_tensor = transforms.ToTensor()
-
-                def __len__(self):
-                    return len(self.entries)
-
-                def __getitem__(self, idx):
-                    entry = self.entries[idx]
-                    image_file = os.path.join(self.image_dir, entry['image_file'])
-                    height = entry['latent_h'] * 16
-                    width = entry['latent_w'] * 16
-                    data_type = entry['type']
-
-                    if data_type == 'native-resolution':
-                        # Resize to exact latent_h*16 x latent_w*16 so RADIO
-                        # token count matches model latent token count
-                        pil_image = Image.open(image_file).convert("RGB").resize(
-                            (width, height), resample=Image.Resampling.BICUBIC)
-                    else:
-                        pil_image = center_crop_resize(
-                            Image.open(image_file).convert("RGB"),
-                            image_size=height)
-
-                    img_ori = self.to_tensor(pil_image)
-                    img_flip = self.to_tensor(hflip(pil_image))
-                    return idx, img_ori, img_flip
-
-            # Collate that keeps variable-sized tensors as lists
-            def _radio_collate(batch):
-                idxs, oris, flips = zip(*batch)
-                return list(idxs), list(oris), list(flips)
-
             def _radio_worker(gpu_id, entries, image_dir, radio_feature_dir,
                               radio_checkpoint, min_image_size, max_image_size):
                 device = f"cuda:{gpu_id}"
@@ -487,12 +490,12 @@ def main():
                 enc.to(device=device, dtype=radio_dtype).eval()
                 enc.requires_grad_(False)
 
-                ds = _RadioPreprocessDataset(entries, image_dir,
-                                             min_image_size, max_image_size)
+                ds = RadioPreprocessDataset(entries, image_dir,
+                                            min_image_size, max_image_size)
                 loader = _DataLoader(
                     ds, batch_size=RADIO_BATCH_SIZE, shuffle=False,
                     num_workers=4, prefetch_factor=4,
-                    collate_fn=_radio_collate, pin_memory=True,
+                    collate_fn=radio_collate_fn, pin_memory=True,
                     multiprocessing_context='spawn',
                 )
                 encoded = 0
