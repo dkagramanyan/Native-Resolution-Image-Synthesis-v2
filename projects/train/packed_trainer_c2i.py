@@ -325,8 +325,23 @@ def main(args):
     if accelerator.is_main_process and getattr(train_config, 'tracker', None) != None:
         tracker_project_name = project_dir.split('/')[-1]
         tracker_kwargs = getattr(train_config, 'tracker_kwargs', {})
-        # Convert OmegaConf to plain dict for tensorboard compatibility
-        config_dict = OmegaConf.to_container(config, resolve=True)
+        # Flatten config to scalar values for tensorboard hparams compatibility
+        def _flatten_dict(d, prefix=''):
+            flat = {}
+            for k, v in d.items():
+                key = f"{prefix}{k}" if not prefix else f"{prefix}/{k}"
+                if isinstance(v, dict):
+                    flat.update(_flatten_dict(v, key))
+                elif isinstance(v, (list, tuple)):
+                    flat[key] = str(v)
+                elif v is None:
+                    flat[key] = "null"
+                elif isinstance(v, (int, float, str, bool)):
+                    flat[key] = v
+                else:
+                    flat[key] = str(v)
+            return flat
+        config_dict = _flatten_dict(OmegaConf.to_container(config, resolve=True))
         if tracker_kwargs:
             accelerator.init_trackers(tracker_project_name, config=config_dict, init_kwargs=tracker_kwargs)
         else:
