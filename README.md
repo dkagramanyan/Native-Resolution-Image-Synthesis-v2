@@ -97,12 +97,12 @@ If `radio_feature_dir` is set in `train_config.yaml` (default), the trainer load
 
 ### Step 5. Train
 
-Trains NiT-XL (675M params) with gradient checkpointing (fits on 24GB GPU):
+Trains NiT-XXL (1.37B params) with AdaLN-LoRA on 2x A100 GPUs:
 
 ```bash
 torchrun \
     --nnodes 1 \
-    --nproc_per_node 1 \
+    --nproc_per_node 2 \
     --rdzv_id $RANDOM \
     --rdzv_backend c10d \
     --rdzv_endpoint localhost:60563 \
@@ -113,6 +113,11 @@ torchrun \
 ```
 
 Adjust `--nproc_per_node` to match your number of GPUs. Checkpoints are saved to `workdir/imagenet_9to4/checkpoints/`.
+
+Monitor training:
+```bash
+tensorboard --logdir workdir/imagenet_9to4/logs
+```
 
 
 ## Sampling (step by step)
