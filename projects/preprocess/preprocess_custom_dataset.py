@@ -297,8 +297,16 @@ def parse_args():
         help="Device for VAE encoding. Default: cuda",
     )
     parser.add_argument(
+        "--radio-checkpoint", type=str, default="checkpoints/radio_v2.5-h.pth.tar",
+        help="Path to RADIO encoder checkpoint for precomputing features.",
+    )
+    parser.add_argument(
         "--skip-packing", action="store_true",
         help="Skip the packing step (only encode latents and generate metadata).",
+    )
+    parser.add_argument(
+        "--skip-radio", action="store_true",
+        help="Skip RADIO feature precomputation.",
     )
     return parser.parse_args()
 
@@ -404,13 +412,71 @@ def main():
     zf_extract.close()
     print(f"Extracted images to {image_dir}")
 
+    # --- Precompute RADIO features ---
+    radio_feature_dir = os.path.join(dataset_root, "radio-features")
+    if not args.skip_radio:
+        print(f"\n=== Precomputing RADIO features ===")
+        from nit.models.nvidia_radio.hubconf import radio_model
+        radio_dtype = torch.bfloat16
+        encoder = radio_model(
+            version=args.radio_checkpoint, progress=True, support_packing=True
+        )
+        encoder.to(device=args.device, dtype=radio_dtype).eval()
+        encoder.requires_grad_(False)
+
+        to_tensor = transforms.ToTensor()
+        radio_skipped = 0
+        radio_encoded = 0
+        for entry in tqdm(all_meta_entries, desc="RADIO features"):
+            output_file = os.path.join(radio_feature_dir, entry['latent_file'])
+            if os.path.exists(output_file):
+                radio_skipped += 1
+                continue
+
+            image_file = os.path.join(image_dir, entry['image_file'])
+            height = entry['latent_h'] * 16
+            width = entry['latent_w'] * 16
+            data_type = entry['type']
+
+            if data_type == 'native-resolution':
+                preprocess = functools.partial(native_resolution_resize,
+                                               min_image_size=args.min_image_size,
+                                               max_image_size=args.max_image_size)
+            else:
+                assert height == width
+                preprocess = functools.partial(center_crop_resize, image_size=height)
+
+            pil_image = preprocess(pil_image=Image.open(image_file).convert("RGB"))
+            pil_flipped = hflip(pil_image)
+
+            img_ori = to_tensor(pil_image).unsqueeze(0).to(device=args.device, dtype=radio_dtype)
+            img_flip = to_tensor(pil_flipped).unsqueeze(0).to(device=args.device, dtype=radio_dtype)
+
+            with torch.no_grad(), torch.cuda.amp.autocast(dtype=radio_dtype):
+                _, feat_ori = encoder.forward_pack([img_ori])
+                _, feat_flip = encoder.forward_pack([img_flip])
+
+            radio_feature = torch.stack([feat_ori.cpu(), feat_flip.cpu()], dim=0).to(torch.float32)
+            os.makedirs(os.path.dirname(output_file), exist_ok=True)
+            save_file({'radio_feature': radio_feature}, output_file)
+            radio_encoded += 1
+
+        del encoder
+        torch.cuda.empty_cache()
+        print(f"  RADIO: encoded {radio_encoded}, skipped {radio_skipped} existing.")
+
     # --- Packing ---
     if not args.skip_packing:
-        print(f"\n=== Generating packing (max_seq_len={args.max_seq_len}) ===")
         sampler_dir = os.path.join(dataset_root, "sampler_meta")
+        # Generate packing for the requested max_seq_len
+        print(f"\n=== Generating packing (max_seq_len={args.max_seq_len}) ===")
         packed_json_path = create_packing(
             merged_meta_path, args.max_seq_len, sampler_dir
         )
+        # Also generate 8192 packing (for NiT-XXL) if not already covered
+        if args.max_seq_len != 8192:
+            print(f"\n=== Generating packing (max_seq_len=8192, for NiT-XXL) ===")
+            create_packing(merged_meta_path, 8192, sampler_dir)
     else:
         packed_json_path = "<run pack_dataset.py separately>"
 
@@ -451,6 +517,7 @@ def main():
                 "data_types": data_types_used,
                 "latent_dirs": latent_dirs_used,
                 "image_dir": image_dir,
+                "radio_feature_dir": radio_feature_dir,
             },
             "dataloader": {"num_workers": 4, "batch_size": 1},
         },
@@ -504,6 +571,7 @@ def main():
     print(f"Latent dirs:      {latent_dirs_used}")
     print(f"Merged meta:      {merged_meta_path}")
     print(f"Packing JSON:     {packed_json_path}")
+    print(f"RADIO features:   {radio_feature_dir}")
     print(f"Raw images:       {image_dir}")
     print(f"Training config:  {config_path}")
     print(f"\nTo train:")
