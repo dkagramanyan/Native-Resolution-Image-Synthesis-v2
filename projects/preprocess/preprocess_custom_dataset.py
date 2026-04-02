@@ -418,52 +418,103 @@ def main():
         print(f"\n=== Precomputing RADIO features ===")
         from nit.models.nvidia_radio.hubconf import radio_model
         radio_dtype = torch.bfloat16
-        encoder = radio_model(
-            version=args.radio_checkpoint, progress=True, support_packing=True
-        )
-        encoder.to(device=args.device, dtype=radio_dtype).eval()
-        encoder.requires_grad_(False)
 
-        to_tensor = transforms.ToTensor()
+        # Filter entries that still need processing
+        pending_entries = []
         radio_skipped = 0
-        radio_encoded = 0
-        for entry in tqdm(all_meta_entries, desc="RADIO features"):
+        for entry in all_meta_entries:
             output_file = os.path.join(radio_feature_dir, entry['latent_file'])
             if os.path.exists(output_file):
                 radio_skipped += 1
-                continue
-
-            image_file = os.path.join(image_dir, entry['image_file'])
-            height = entry['latent_h'] * 16
-            width = entry['latent_w'] * 16
-            data_type = entry['type']
-
-            if data_type == 'native-resolution':
-                preprocess = functools.partial(native_resolution_resize,
-                                               min_image_size=args.min_image_size,
-                                               max_image_size=args.max_image_size)
             else:
-                assert height == width
-                preprocess = functools.partial(center_crop_resize, image_size=height)
+                pending_entries.append(entry)
 
-            pil_image = preprocess(pil_image=Image.open(image_file).convert("RGB"))
-            pil_flipped = hflip(pil_image)
+        if radio_skipped > 0:
+            print(f"  Skipping {radio_skipped} already-computed features.")
 
-            img_ori = to_tensor(pil_image).unsqueeze(0).to(device=args.device, dtype=radio_dtype)
-            img_flip = to_tensor(pil_flipped).unsqueeze(0).to(device=args.device, dtype=radio_dtype)
+        if pending_entries:
+            # Use all available GPUs
+            num_gpus = torch.cuda.device_count()
+            print(f"  Processing {len(pending_entries)} entries on {num_gpus} GPU(s)")
 
-            with torch.no_grad(), torch.cuda.amp.autocast(dtype=radio_dtype):
-                _, feat_ori = encoder.forward_pack([img_ori])
-                _, feat_flip = encoder.forward_pack([img_flip])
+            # Split work across GPUs
+            def _radio_worker(gpu_id, entries, image_dir, radio_feature_dir,
+                              radio_checkpoint, min_image_size, max_image_size):
+                device = f"cuda:{gpu_id}"
+                enc = radio_model(
+                    version=radio_checkpoint, progress=False, support_packing=True
+                )
+                enc.to(device=device, dtype=radio_dtype).eval()
+                enc.requires_grad_(False)
+                to_tensor = transforms.ToTensor()
+                encoded = 0
 
-            radio_feature = torch.stack([feat_ori.cpu(), feat_flip.cpu()], dim=0).to(torch.float32)
-            os.makedirs(os.path.dirname(output_file), exist_ok=True)
-            save_file({'radio_feature': radio_feature}, output_file)
-            radio_encoded += 1
+                for entry in tqdm(entries, desc=f"RADIO GPU:{gpu_id}",
+                                  position=gpu_id, leave=True):
+                    output_file = os.path.join(radio_feature_dir, entry['latent_file'])
+                    image_file = os.path.join(image_dir, entry['image_file'])
+                    height = entry['latent_h'] * 16
+                    width = entry['latent_w'] * 16
+                    data_type = entry['type']
 
-        del encoder
-        torch.cuda.empty_cache()
-        print(f"  RADIO: encoded {radio_encoded}, skipped {radio_skipped} existing.")
+                    if data_type == 'native-resolution':
+                        preprocess = functools.partial(
+                            native_resolution_resize,
+                            min_image_size=min_image_size,
+                            max_image_size=max_image_size)
+                    else:
+                        assert height == width
+                        preprocess = functools.partial(center_crop_resize, image_size=height)
+
+                    pil_image = preprocess(pil_image=Image.open(image_file).convert("RGB"))
+                    pil_flipped = hflip(pil_image)
+
+                    img_ori = to_tensor(pil_image).unsqueeze(0).to(device=device, dtype=radio_dtype)
+                    img_flip = to_tensor(pil_flipped).unsqueeze(0).to(device=device, dtype=radio_dtype)
+
+                    with torch.no_grad(), torch.amp.autocast('cuda', dtype=radio_dtype):
+                        _, feat_ori = enc.forward_pack([img_ori])
+                        _, feat_flip = enc.forward_pack([img_flip])
+
+                    radio_feature = torch.stack(
+                        [feat_ori.cpu(), feat_flip.cpu()], dim=0
+                    ).to(torch.float32)
+                    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+                    save_file({'radio_feature': radio_feature}, output_file)
+                    encoded += 1
+
+                del enc
+                torch.cuda.empty_cache()
+                return encoded
+
+            if num_gpus > 1:
+                import concurrent.futures
+                # Split entries evenly across GPUs
+                chunks = [[] for _ in range(num_gpus)]
+                for i, entry in enumerate(pending_entries):
+                    chunks[i % num_gpus].append(entry)
+
+                radio_encoded = 0
+                with concurrent.futures.ThreadPoolExecutor(max_workers=num_gpus) as executor:
+                    futures = []
+                    for gpu_id in range(num_gpus):
+                        fut = executor.submit(
+                            _radio_worker, gpu_id, chunks[gpu_id],
+                            image_dir, radio_feature_dir,
+                            args.radio_checkpoint, args.min_image_size, args.max_image_size
+                        )
+                        futures.append(fut)
+                    for fut in concurrent.futures.as_completed(futures):
+                        radio_encoded += fut.result()
+            else:
+                radio_encoded = _radio_worker(
+                    0, pending_entries, image_dir, radio_feature_dir,
+                    args.radio_checkpoint, args.min_image_size, args.max_image_size
+                )
+
+            print(f"  RADIO: encoded {radio_encoded}, skipped {radio_skipped} existing.")
+        else:
+            print(f"  All {radio_skipped} RADIO features already exist, nothing to do.")
 
     # --- Packing ---
     if not args.skip_packing:
