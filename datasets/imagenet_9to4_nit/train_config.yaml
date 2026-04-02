@@ -68,7 +68,9 @@ training:
   proportion_empty_prompts: 0.0
   mixed_precision: bf16
   allow_tf32: true
-  validation_steps: 500
+  validation_steps: 2000
+  validation_image_sizes: [256, 512, 1024]
+  validation_fid_samples: 100
   checkpoint_list:
   - 25000
   - 50000

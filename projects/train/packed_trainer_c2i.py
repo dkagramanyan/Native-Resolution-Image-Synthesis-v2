@@ -479,8 +479,12 @@ def main(args):
                 torch.cuda.empty_cache()
             
                 if global_steps % train_config.validation_steps == 0:
+                    val_image_sizes = getattr(train_config, 'validation_image_sizes', [256, 512, 1024])
+                    val_fid_samples = getattr(train_config, 'validation_fid_samples', 100)
                     log_validation(
                         model, accelerator, model_config, sample_dir, global_steps,
+                        image_sizes=tuple(val_image_sizes),
+                        fid_num_samples=val_fid_samples,
                         fid_real_image_dir=data_config.dataset.get('image_dir', None),
                     )
             logs = {
