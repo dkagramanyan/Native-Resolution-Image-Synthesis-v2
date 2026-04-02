@@ -417,7 +417,10 @@ def main():
     if not args.skip_radio:
         print(f"\n=== Precomputing RADIO features ===")
         from nit.models.nvidia_radio.hubconf import radio_model
+        from torch.utils.data import DataLoader as _DataLoader, Dataset as _Dataset
+        import concurrent.futures
         radio_dtype = torch.bfloat16
+        RADIO_BATCH_SIZE = 16  # images per forward_pack call
 
         # Filter entries that still need processing
         pending_entries = []
@@ -433,11 +436,48 @@ def main():
             print(f"  Skipping {radio_skipped} already-computed features.")
 
         if pending_entries:
-            # Use all available GPUs
             num_gpus = torch.cuda.device_count()
-            print(f"  Processing {len(pending_entries)} entries on {num_gpus} GPU(s)")
+            print(f"  Processing {len(pending_entries)} entries on {num_gpus} GPU(s), "
+                  f"batch_size={RADIO_BATCH_SIZE}")
 
-            # Split work across GPUs
+            # Dataset that does CPU-heavy image loading/preprocessing in workers
+            class _RadioPreprocessDataset(_Dataset):
+                def __init__(self, entries, image_dir, min_image_size, max_image_size):
+                    self.entries = entries
+                    self.image_dir = image_dir
+                    self.min_image_size = min_image_size
+                    self.max_image_size = max_image_size
+                    self.to_tensor = transforms.ToTensor()
+
+                def __len__(self):
+                    return len(self.entries)
+
+                def __getitem__(self, idx):
+                    entry = self.entries[idx]
+                    image_file = os.path.join(self.image_dir, entry['image_file'])
+                    height = entry['latent_h'] * 16
+                    width = entry['latent_w'] * 16
+                    data_type = entry['type']
+
+                    if data_type == 'native-resolution':
+                        pil_image = native_resolution_resize(
+                            Image.open(image_file).convert("RGB"),
+                            min_image_size=self.min_image_size,
+                            max_image_size=self.max_image_size)
+                    else:
+                        pil_image = center_crop_resize(
+                            Image.open(image_file).convert("RGB"),
+                            image_size=height)
+
+                    img_ori = self.to_tensor(pil_image)
+                    img_flip = self.to_tensor(hflip(pil_image))
+                    return idx, img_ori, img_flip
+
+            # Collate that keeps variable-sized tensors as lists
+            def _radio_collate(batch):
+                idxs, oris, flips = zip(*batch)
+                return list(idxs), list(oris), list(flips)
+
             def _radio_worker(gpu_id, entries, image_dir, radio_feature_dir,
                               radio_checkpoint, min_image_size, max_image_size):
                 device = f"cuda:{gpu_id}"
@@ -446,49 +486,57 @@ def main():
                 )
                 enc.to(device=device, dtype=radio_dtype).eval()
                 enc.requires_grad_(False)
-                to_tensor = transforms.ToTensor()
+
+                ds = _RadioPreprocessDataset(entries, image_dir,
+                                             min_image_size, max_image_size)
+                loader = _DataLoader(
+                    ds, batch_size=RADIO_BATCH_SIZE, shuffle=False,
+                    num_workers=4, prefetch_factor=4,
+                    collate_fn=_radio_collate, pin_memory=True,
+                )
                 encoded = 0
 
-                for entry in tqdm(entries, desc=f"RADIO GPU:{gpu_id}",
-                                  position=gpu_id, leave=True):
-                    output_file = os.path.join(radio_feature_dir, entry['latent_file'])
-                    image_file = os.path.join(image_dir, entry['image_file'])
-                    height = entry['latent_h'] * 16
-                    width = entry['latent_w'] * 16
-                    data_type = entry['type']
-
-                    if data_type == 'native-resolution':
-                        preprocess = functools.partial(
-                            native_resolution_resize,
-                            min_image_size=min_image_size,
-                            max_image_size=max_image_size)
-                    else:
-                        assert height == width
-                        preprocess = functools.partial(center_crop_resize, image_size=height)
-
-                    pil_image = preprocess(pil_image=Image.open(image_file).convert("RGB"))
-                    pil_flipped = hflip(pil_image)
-
-                    img_ori = to_tensor(pil_image).unsqueeze(0).to(device=device, dtype=radio_dtype)
-                    img_flip = to_tensor(pil_flipped).unsqueeze(0).to(device=device, dtype=radio_dtype)
+                for batch_idxs, batch_oris, batch_flips in tqdm(
+                    loader, desc=f"RADIO GPU:{gpu_id}",
+                    position=gpu_id, leave=True
+                ):
+                    # Move batch to GPU as list of [1,C,H,W] tensors
+                    gpu_oris = [t.unsqueeze(0).to(device, dtype=radio_dtype) for t in batch_oris]
+                    gpu_flips = [t.unsqueeze(0).to(device, dtype=radio_dtype) for t in batch_flips]
 
                     with torch.no_grad(), torch.amp.autocast('cuda', dtype=radio_dtype):
-                        _, feat_ori = enc.forward_pack([img_ori])
-                        _, feat_flip = enc.forward_pack([img_flip])
+                        _, feats_ori = enc.forward_pack(gpu_oris)
+                        _, feats_flip = enc.forward_pack(gpu_flips)
 
-                    radio_feature = torch.stack(
-                        [feat_ori.cpu(), feat_flip.cpu()], dim=0
-                    ).to(torch.float32)
-                    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-                    save_file({'radio_feature': radio_feature}, output_file)
-                    encoded += 1
+                    # forward_pack returns packed features; split by cu_seqlens
+                    # Actually forward_pack with list input returns concatenated features
+                    # We need to split them back per image
+                    # Compute per-image token counts from spatial dims
+                    token_counts = []
+                    for t in batch_oris:
+                        h, w = t.shape[1], t.shape[2]  # C, H, W
+                        tokens = (h // 16) * (w // 16)  # RADIO patch size = 16
+                        token_counts.append(tokens)
+
+                    # Split concatenated features
+                    feats_ori_list = feats_ori.cpu().to(torch.float32).split(token_counts, dim=0)
+                    feats_flip_list = feats_flip.cpu().to(torch.float32).split(token_counts, dim=0)
+
+                    for i, idx in enumerate(batch_idxs):
+                        entry = entries[idx]
+                        output_file = os.path.join(radio_feature_dir, entry['latent_file'])
+                        radio_feature = torch.stack(
+                            [feats_ori_list[i], feats_flip_list[i]], dim=0
+                        )
+                        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+                        save_file({'radio_feature': radio_feature.contiguous()}, output_file)
+                        encoded += 1
 
                 del enc
                 torch.cuda.empty_cache()
                 return encoded
 
             if num_gpus > 1:
-                import concurrent.futures
                 # Split entries evenly across GPUs
                 chunks = [[] for _ in range(num_gpus)]
                 for i, entry in enumerate(pending_entries):
