@@ -56,19 +56,15 @@ def log_validation(
     num_steps=50, cfg_scale=1.5,
     fid_num_samples=100, fid_real_image_dir=None,
 ):
-    """Generate sample images at multiple resolutions and compute FID per resolution.
+    """Generate sample images at multiple resolutions and compute FID.
 
-    Uses 3-phase approach to avoid OOM:
-      Phase 1: Generate latents with NiT on GPU, store on CPU
-      Phase 2: Move NiT to CPU, load VAE on GPU, decode and save images
-      Phase 3: Compute FID per resolution, cleanup, move NiT back to GPU
+    Distributed across all ranks with batched generation for full GPU utilization.
+    Phase 1: Generate latents (distributed + batched across all GPUs)
+    Phase 2: Decode with VAE (distributed, each rank saves its share to disk)
+    Phase 3: Grid + FID (rank 0 reads from disk)
     """
-    from nit.utils.model_utils import dc_ae_decode
     from diffusers import AutoencoderDC
     from PIL import Image
-
-    if not accelerator.is_main_process:
-        return
 
     unwrapped_model = accelerator.unwrap_model(model)
     was_training = unwrapped_model.training
@@ -78,109 +74,174 @@ def log_validation(
     dtype = torch.bfloat16
     num_classes = model_config.network.params.num_classes
     patch_size = model_config.network.params.patch_size
+    in_channels = model_config.network.params.in_channels
     spatial_downsample = 32  # DC-AE
+    rank = accelerator.process_index
+    world_size = accelerator.num_processes
+    MAX_GEN_TOKENS = 8192  # max packed tokens per generation batch
 
     step_dir = os.path.join(sample_dir, f"step_{global_steps:07d}")
-    os.makedirs(step_dir, exist_ok=True)
+    if accelerator.is_main_process:
+        os.makedirs(step_dir, exist_ok=True)
+    accelerator.wait_for_everyone()
 
-    # ── Phase 1: Generate latents on GPU, store on CPU ──────────────────────
-    # Per resolution: grid samples + FID samples
-    all_latents = {}  # {image_size: [latent_cpu, ...]}
+    # ── Phase 1: Generate latents (distributed + batched) ──────────────────
+    all_latents = {}  # all ranks get all latents after gather
 
     for image_size in image_sizes:
         latent_h = image_size // spatial_downsample
         latent_w = image_size // spatial_downsample
-        total_for_res = max(fid_num_samples, num_samples_per_class * num_classes)
-        latents_list = []
+        tokens_per_image = latent_h * latent_w
+        total = max(fid_num_samples, num_samples_per_class * num_classes)
 
-        logger.info(f"Validation: generating {total_for_res} latents at {image_size}x{image_size}...")
-        for i in range(total_for_res):
-            class_idx = i % num_classes
-            latent = _generate_one_sample(
-                unwrapped_model, class_idx, num_classes,
+        # Batch size: pack multiple images per forward pass
+        cfg_factor = 2 if cfg_scale > 1.0 else 1
+        gen_batch = max(1, MAX_GEN_TOKENS // (tokens_per_image * cfg_factor))
+
+        all_classes = [i % num_classes for i in range(total)]
+        my_indices = list(range(rank, total, world_size))
+        my_classes = [all_classes[i] for i in my_indices]
+
+        if accelerator.is_main_process:
+            logger.info(
+                f"Validation: generating {total} latents at {image_size}x{image_size} "
+                f"across {world_size} GPUs (batch={gen_batch})..."
+            )
+
+        my_latents = []
+        for b in range(0, len(my_classes), gen_batch):
+            b_classes = my_classes[b:b + gen_batch]
+            b_latents = _generate_batch_samples(
+                unwrapped_model, b_classes, num_classes,
                 latent_h, latent_w, patch_size,
                 num_steps, cfg_scale, dtype, device,
             )
-            latents_list.append(latent.cpu())
-        all_latents[image_size] = latents_list
+            my_latents.extend(b_latents)
 
-    # ── Phase 2: Move NiT to CPU, load VAE, decode and save ────────────────
+        # Gather latents from all ranks (pad to equal size)
+        max_per_rank = (total + world_size - 1) // world_size
+        C_l = in_channels
+        H_l = latent_h * patch_size
+        W_l = latent_w * patch_size
+
+        if my_latents:
+            my_tensor = torch.cat(my_latents, dim=0)
+        else:
+            my_tensor = torch.zeros(0, C_l, H_l, W_l)
+
+        pad_n = max_per_rank - my_tensor.shape[0]
+        if pad_n > 0:
+            my_tensor = torch.cat([
+                my_tensor,
+                torch.zeros(pad_n, C_l, H_l, W_l, dtype=my_tensor.dtype),
+            ])
+
+        gathered = accelerator.gather(my_tensor.to(device)).cpu()
+        # gathered: (world_size * max_per_rank, C, H, W)
+
+        # Reorder from [rank0_block, rank1_block, ...] to original sample order
+        reordered = []
+        for i in range(total):
+            r = i % world_size
+            local_i = i // world_size
+            reordered.append(gathered[r * max_per_rank + local_i].unsqueeze(0))
+        all_latents[image_size] = reordered
+
+    # ── Phase 2: Decode with VAE (distributed, save to disk) ───────────────
     unwrapped_model.cpu()
     torch.cuda.empty_cache()
+    accelerator.wait_for_everyone()
 
     vae = AutoencoderDC.from_pretrained(model_config.vae_dir).to(device, dtype=torch.float32)
     vae.eval()
 
-    total_saved = 0
-    fid_images_per_res = {}  # {image_size: [numpy_img, ...]}
-
     for image_size in image_sizes:
-        res_label = f"{image_size}x{image_size}"
-        res_dir = os.path.join(step_dir, res_label)
-        os.makedirs(res_dir, exist_ok=True)
+        res_dir = os.path.join(step_dir, f"{image_size}x{image_size}")
+        if accelerator.is_main_process:
+            os.makedirs(res_dir, exist_ok=True)
+        accelerator.wait_for_everyone()
 
-        decoded_images = []
-        logger.info(f"Validation: decoding {len(all_latents[image_size])} samples at {res_label}...")
-        for i, latent in enumerate(all_latents[image_size]):
-            img = _decode_latent_to_numpy(vae, latent, device)
+        latents = all_latents[image_size]
+        my_decode_indices = list(range(rank, len(latents), world_size))
+
+        if accelerator.is_main_process:
+            logger.info(f"Validation: decoding {len(latents)} samples at {image_size}x{image_size}...")
+
+        for i in my_decode_indices:
+            img = _decode_latent_to_numpy(vae, latents[i], device)
             Image.fromarray(img).save(os.path.join(res_dir, f"{i:05d}.png"))
-            decoded_images.append(img)
-            total_saved += 1
-
-        # Save grid from first num_samples_per_class * num_classes images
-        grid_count = num_samples_per_class * num_classes
-        grid_images = decoded_images[:grid_count]
-        _save_grid(grid_images, num_classes, num_samples_per_class,
-                   os.path.join(step_dir, f"grid_{res_label}.png"))
-
-        fid_images_per_res[image_size] = decoded_images
 
     del vae, all_latents
     torch.cuda.empty_cache()
+    accelerator.wait_for_everyone()
 
-    # ── Phase 3: Compute FID per resolution, move NiT back ──────────────────
-    for image_size in image_sizes:
-        res_label = f"{image_size}x{image_size}"
-        fid_value = _compute_fid(
-            fid_images_per_res[image_size], fid_real_image_dir, device,
-            resize_to=299,
-        )
-        if fid_value is not None:
-            logger.info(f"Validation step {global_steps}: FID-{res_label} = {fid_value:.4f}")
-            accelerator.log({f"fid_{res_label}": fid_value}, step=global_steps)
+    # ── Phase 3: Grid + FID (rank 0 reads from disk) ──────────────────────
+    if accelerator.is_main_process:
+        total_saved = 0
+        for image_size in image_sizes:
+            res_label = f"{image_size}x{image_size}"
+            res_dir = os.path.join(step_dir, res_label)
+            total = max(fid_num_samples, num_samples_per_class * num_classes)
 
-    del fid_images_per_res
+            images = []
+            for i in range(total):
+                img = np.array(Image.open(os.path.join(res_dir, f"{i:05d}.png")))
+                images.append(img)
+                total_saved += 1
+
+            grid_count = num_samples_per_class * num_classes
+            _save_grid(images[:grid_count], num_classes, num_samples_per_class,
+                       os.path.join(step_dir, f"grid_{res_label}.png"))
+
+            fid_value = _compute_fid(images, fid_real_image_dir, device, resize_to=299)
+            if fid_value is not None:
+                logger.info(f"Validation step {global_steps}: FID-{res_label} = {fid_value:.4f}")
+                accelerator.log({f"fid_{res_label}": fid_value}, step=global_steps)
+
+        logger.info(f"Saved {total_saved} validation images to {step_dir}")
+
+    # ── Cleanup: move NiT back to GPU ──────────────────────────────────────
     torch.cuda.empty_cache()
-
-    # Move NiT back to GPU
     unwrapped_model.to(device)
-
     if was_training:
         unwrapped_model.train()
+    accelerator.wait_for_everyone()
 
-    logger.info(f"Saved {total_saved} validation images to {step_dir}")
 
+def _generate_batch_samples(model, class_indices, num_classes, latent_h, latent_w,
+                             patch_size, num_steps, cfg_scale, dtype, device):
+    """Generate a batch of samples using packed sequences (same resolution).
 
-def _generate_one_sample(model, class_idx, num_classes, latent_h, latent_w,
-                          patch_size, num_steps, cfg_scale, dtype, device):
-    """Generate one latent sample (before VAE decoding)."""
+    Packs multiple images into one forward pass for full GPU utilization.
+    """
+    batch_size = len(class_indices)
+    tokens_per_image = latent_h * latent_w
+
     z = torch.randn(
-        latent_h * latent_w, model.in_channels, patch_size, patch_size,
+        batch_size * tokens_per_image, model.in_channels, patch_size, patch_size,
         device=device, dtype=dtype,
     )
-    y = torch.tensor([class_idx], device=device, dtype=torch.long)
-    hw_list = torch.tensor([[latent_h, latent_w]], device=device, dtype=torch.int)
-    y_null = torch.tensor([num_classes], device=device, dtype=torch.long)
+    y = torch.tensor(class_indices, device=device, dtype=torch.long)
+    hw_list = torch.tensor([[latent_h, latent_w]] * batch_size, device=device, dtype=torch.int)
+    y_null = torch.full((batch_size,), num_classes, device=device, dtype=torch.long)
 
     sample = _euler_sampler_with_null(
         model, z, y, y_null, hw_list,
         num_steps=num_steps, cfg_scale=cfg_scale, dtype=dtype,
     )
-    return rearrange(
-        sample.to(torch.float32),
-        '(h w) c p1 p2 -> 1 c (h p1) (w p2)',
-        h=latent_h, w=latent_w,
-    )
+
+    # Split packed output into individual latents
+    latents = []
+    for i in range(batch_size):
+        start = i * tokens_per_image
+        end = start + tokens_per_image
+        latent = rearrange(
+            sample[start:end].to(torch.float32),
+            '(h w) c p1 p2 -> 1 c (h p1) (w p2)',
+            h=latent_h, w=latent_w,
+        )
+        latents.append(latent.cpu())
+    return latents
 
 
 def _decode_latent_to_numpy(vae, latent, device):
