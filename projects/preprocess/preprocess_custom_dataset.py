@@ -510,21 +510,13 @@ def main():
 
                     with torch.no_grad(), torch.amp.autocast('cuda', dtype=radio_dtype):
                         _, feats_ori = enc.forward_pack(gpu_oris)
+                        ori_counts = enc._last_feature_counts
                         _, feats_flip = enc.forward_pack(gpu_flips)
+                        flip_counts = enc._last_feature_counts
 
-                    # forward_pack returns packed features; split by cu_seqlens
-                    # Actually forward_pack with list input returns concatenated features
-                    # We need to split them back per image
-                    # Compute per-image token counts from spatial dims
-                    token_counts = []
-                    for t in batch_oris:
-                        h, w = t.shape[1], t.shape[2]  # C, H, W
-                        tokens = (h // 16) * (w // 16)  # RADIO patch size = 16
-                        token_counts.append(tokens)
-
-                    # Split concatenated features
-                    feats_ori_list = feats_ori.cpu().to(torch.float32).split(token_counts, dim=0)
-                    feats_flip_list = feats_flip.cpu().to(torch.float32).split(token_counts, dim=0)
+                    # Split concatenated features using actual per-image counts from RADIO
+                    feats_ori_list = feats_ori.cpu().to(torch.float32).split(ori_counts, dim=0)
+                    feats_flip_list = feats_flip.cpu().to(torch.float32).split(flip_counts, dim=0)
 
                     for i, idx in enumerate(batch_idxs):
                         entry = entries[idx]

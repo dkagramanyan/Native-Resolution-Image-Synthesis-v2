@@ -184,6 +184,7 @@ class RADIOModel(nn.Module):
         x = [self.input_conditioner(_x) for _x in x]
         y, cu_seqlens = self.model.forward_features(x)
         all_summary, spatial_features = [], []
+        feature_counts = []
         num_cls_tokens = self.model.patch_generator.num_cls_tokens
         num_skip = self.model.patch_generator.num_skip
         for i in range(len(cu_seqlens)-1):
@@ -191,8 +192,10 @@ class RADIOModel(nn.Module):
             all_feat = y[cu_seqlens[i]: cu_seqlens[i+1]][num_skip :]
             all_summary.append(summary)
             spatial_features.append(all_feat)
+            feature_counts.append(all_feat.shape[0])
         all_summary = torch.cat(all_summary)
         spatial_features = torch.cat(spatial_features)
+        self._last_feature_counts = feature_counts
         return all_summary, spatial_features
 
     def _extract_final(self, x: torch.Tensor, y: torch.Tensor, feature_fmt: str = 'NLC'):
