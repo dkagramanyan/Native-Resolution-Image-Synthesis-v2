@@ -406,7 +406,8 @@ class NiT(nn.Module):
                 x = block(x, c, cu_seqlens, freqs_cos, freqs_sin)   # (N, D)
             else:
                 x = torch.utils.checkpoint.checkpoint(
-                    self.ckpt_wrapper(block), x, c, cu_seqlens, freqs_cos, freqs_sin
+                    self.ckpt_wrapper(block), x, c, cu_seqlens, freqs_cos, freqs_sin,
+                    use_reentrant=False,
                 )  
             if (i + 1) == self.encoder_depth and return_zs:
                 zs = [self.projector(x)]

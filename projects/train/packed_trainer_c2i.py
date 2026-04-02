@@ -224,11 +224,14 @@ def main(args):
         learning_rate = train_config.learning_rate
     
     
+    # Check if precomputed RADIO features are available
+    use_precomputed_radio = getattr(data_config.dataset, 'radio_feature_dir', None) is not None
+
     # prepare model, dataloader, optimizer and scheduler
     model = instantiate_from_config(model_config.network).to(device=accelerator.device)
     model.train()
     if model_config.use_ema:
-        ema_model = deepcopy(model)
+        ema_model = deepcopy(model)  # deepcopy before compile
         ema_model.train()
         ema_model.requires_grad_(False)
     # Handle mixed precision and device placement
@@ -300,6 +303,9 @@ def main(args):
         num_training_steps=train_config.max_train_steps,
     )
 
+    # Compile model for faster training
+    model = torch.compile(model)
+
     # Prepare for training
     # Prepare everything with our `accelerator`.
     if model_config.use_ema:
@@ -311,9 +317,10 @@ def main(args):
             model, optimizer, lr_scheduler
         )
 
-    # transport 
+    # transport
     loss_fn = FlowMatchingLoss(**OmegaConf.to_container(model_config.transport))
-    if model_config.enc_type == 'radio':
+    encoder = None
+    if model_config.enc_type == 'radio' and not use_precomputed_radio:
         from nit.models.nvidia_radio.hubconf import radio_model
         encoder = radio_model(version=model_config.enc_dir, progress=True, support_packing=True)
         encoder.to(device=accelerator.device).eval()
@@ -404,7 +411,9 @@ def main(args):
                 
         feat_enc_start = timer()
         zs = []
-        if model_config.enc_type == 'radio':
+        if 'radio_feature' in batch:
+            zs.append(batch['radio_feature'].squeeze(0).to(accelerator.device))
+        elif model_config.enc_type == 'radio' and encoder is not None:
             with torch.no_grad(), accelerator.autocast():
                 raw_images = [(image.unsqueeze(0)+1.0)/2.0 for image in batch_image]
                 _, z = encoder.forward_pack(raw_images)

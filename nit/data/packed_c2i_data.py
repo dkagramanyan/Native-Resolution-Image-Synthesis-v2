@@ -56,6 +56,8 @@ def packed_collate_fn(batch):
     label = []
     hw_list = []
     image = []
+    packed_radio = []
+    has_radio = 'radio_feature' in batch[0]
     for data in batch:
         C, H, W = data['latent'].shape
         latent = rearrange(
@@ -65,60 +67,76 @@ def packed_collate_fn(batch):
         hw_list.append([H/PATCH_SIZE, W/PATCH_SIZE])
         label.append(data['label'])
         image.append(data['image'])
+        if has_radio:
+            packed_radio.append(data['radio_feature'])
     packed_latent = torch.concat(packed_latent)
     label = torch.tensor(label)
     hw_list = torch.tensor(hw_list, dtype=torch.int32)
-    return dict(image=image, latent=packed_latent, label=label, hw_list=hw_list)
+    result = dict(image=image, latent=packed_latent, label=label, hw_list=hw_list)
+    if has_radio:
+        result['radio_feature'] = torch.cat(packed_radio, dim=0)
+    return result
 
 
 
 class ImprovedPackedImageNetLatentDataset(Dataset):
-    def __init__(self, packed_json, jsonl_dir, data_types, latent_dirs, image_dir):
+    def __init__(self, packed_json, jsonl_dir, data_types, latent_dirs, image_dir,
+                 radio_feature_dir=None):
         super().__init__()
         assert len(data_types) == len(latent_dirs)
         self.type_to_dir = dict()
         for i, data_type in enumerate(data_types):
             self.type_to_dir[data_type] = latent_dirs[i]
         self.image_dir = image_dir
+        self.radio_feature_dir = radio_feature_dir
 
         with open(packed_json, 'r') as fp:
             self.packed_dataset = json.load(fp)
 
         with open(jsonl_dir, 'r') as fp:
             self.dataset = [json.loads(line) for line in fp]
-        
-    
+
+
     def __len__(self):
         return len(self.dataset)
 
     def __getitem__(self, index):
         data_meta = self.dataset[index]
-        
+
         data_item = dict()
         data_type = data_meta['type']
         latent_file = os.path.join(self.type_to_dir[data_type], data_meta['latent_file'])
-        image_file = os.path.join(self.image_dir, data_meta['image_file'])
 
         data = load_file(latent_file)
-        
+
         height = data_meta['latent_h'] * 16
         width = data_meta['latent_w'] * 16
-        
-        if data_type == 'native-resolution':
-            preprocess = partial(resize_arr, height=height, width=width)
-        else:
-            assert height == width
-            preprocess = partial(center_crop_arr, image_size=height)
-
-        transform = transforms.Compose([
-            transforms.Lambda(lambda pil_image: preprocess(pil_image=pil_image)),
-            transforms.Lambda(lambda pil_image: (pil_image, hflip(pil_image))),
-            transforms.Lambda(lambda crops: torch.stack([transforms.ToTensor()(crop) for crop in crops])), # returns a 4D tensor
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
-        ])
 
         rand_idx = torch.randint(low=0, high=2, size=(1,)).item()
-        data_item['image'] = transform(Image.open(image_file).convert("RGB"))[rand_idx]
+
+        # Load precomputed RADIO features if available
+        if self.radio_feature_dir is not None:
+            radio_file = os.path.join(self.radio_feature_dir, data_meta['latent_file'])
+            radio_data = load_file(radio_file)
+            data_item['radio_feature'] = radio_data['radio_feature'][rand_idx]
+            # Still need image for non-radio uses; use a dummy to save I/O
+            data_item['image'] = torch.zeros(3, 1, 1)
+        else:
+            image_file = os.path.join(self.image_dir, data_meta['image_file'])
+            if data_type == 'native-resolution':
+                preprocess = partial(resize_arr, height=height, width=width)
+            else:
+                assert height == width
+                preprocess = partial(center_crop_arr, image_size=height)
+
+            transform = transforms.Compose([
+                transforms.Lambda(lambda pil_image: preprocess(pil_image=pil_image)),
+                transforms.Lambda(lambda pil_image: (pil_image, hflip(pil_image))),
+                transforms.Lambda(lambda crops: torch.stack([transforms.ToTensor()(crop) for crop in crops])), # returns a 4D tensor
+                transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
+            ])
+            data_item['image'] = transform(Image.open(image_file).convert("RGB"))[rand_idx]
+
         data_item['latent'] = data['latent'][rand_idx]
         data_item['label'] = data['label']
         return data_item

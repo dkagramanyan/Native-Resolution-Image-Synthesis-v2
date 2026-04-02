@@ -40,6 +40,7 @@ data:
     - datasets/imagenet_9to4_nit/dc-ae-f32c32-sana-1.1-diffusers-512x512
     - datasets/imagenet_9to4_nit/dc-ae-f32c32-sana-1.1-diffusers-256x256
     image_dir: datasets/imagenet_9to4_nit/images
+    radio_feature_dir: datasets/imagenet_9to4_nit/radio-features
   dataloader:
     num_workers: 4
     batch_size: 1
@@ -55,7 +56,7 @@ training:
   scale_lr: true
   lr_scheduler: constant
   lr_warmup_steps: 0
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
   optimizer:
     target: torch.optim.AdamW
     params:
