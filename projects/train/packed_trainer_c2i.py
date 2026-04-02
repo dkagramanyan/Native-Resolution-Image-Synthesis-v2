@@ -466,6 +466,7 @@ def main(args):
                 if global_steps % train_config.validation_steps == 0:
                     log_validation(
                         model, accelerator, model_config, sample_dir, global_steps,
+                        fid_real_image_dir=data_config.dataset.get('image_dir', None),
                     )
             logs = {
                 # loss and lr

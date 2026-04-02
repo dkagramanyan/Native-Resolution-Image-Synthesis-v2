@@ -1,6 +1,6 @@
 import os
 import torch
-import functools
+import numpy as np
 from collections import OrderedDict
 from copy import deepcopy
 from diffusers.utils import logging
@@ -41,7 +41,6 @@ def update_ema(ema_model, model, decay=0.9999):
     model_params = OrderedDict(model.named_parameters())
 
     for name, param in model_params.items():
-        # TODO: Consider applying only to params that require_grad to avoid small numerical changes of pos_embed
         ema_params[name].mul_(decay).add_(param.data, alpha=1 - decay)
 
 
@@ -50,19 +49,14 @@ def log_validation(
     model, accelerator, model_config, sample_dir, global_steps,
     num_samples_per_class=4, image_sizes=(256, 512, 1024),
     num_steps=50, cfg_scale=1.5,
+    fid_num_samples=100, fid_real_image_dir=None,
 ):
-    """Generate and save sample images at multiple resolutions during training.
+    """Generate sample images at multiple resolutions and compute FID per resolution.
 
-    Args:
-        model: the NiT model (accelerator-wrapped)
-        accelerator: the Accelerator instance
-        model_config: model config from OmegaConf
-        sample_dir: directory to save generated images
-        global_steps: current training step
-        num_samples_per_class: number of images to generate per class per resolution
-        image_sizes: tuple of output resolutions to generate
-        num_steps: number of ODE sampling steps
-        cfg_scale: classifier-free guidance scale
+    Uses 3-phase approach to avoid OOM:
+      Phase 1: Generate latents with NiT on GPU, store on CPU
+      Phase 2: Move NiT to CPU, load VAE on GPU, decode and save images
+      Phase 3: Compute FID per resolution, cleanup, move NiT back to GPU
     """
     from nit.utils.model_utils import dc_ae_decode
     from diffusers import AutoencoderDC
@@ -71,7 +65,6 @@ def log_validation(
     if not accelerator.is_main_process:
         return
 
-    # Unwrap model for inference
     unwrapped_model = accelerator.unwrap_model(model)
     was_training = unwrapped_model.training
     unwrapped_model.eval()
@@ -82,79 +75,170 @@ def log_validation(
     patch_size = model_config.network.params.patch_size
     spatial_downsample = 32  # DC-AE
 
-    # Load VAE for decoding (only when needed, then discard to save memory)
-    vae = AutoencoderDC.from_pretrained(model_config.vae_dir).to(device, dtype=torch.float32)
-    vae.eval()
-
     step_dir = os.path.join(sample_dir, f"step_{global_steps:07d}")
     os.makedirs(step_dir, exist_ok=True)
 
-    total_saved = 0
+    # ── Phase 1: Generate latents on GPU, store on CPU ──────────────────────
+    # Per resolution: grid samples + FID samples
+    all_latents = {}  # {image_size: [latent_cpu, ...]}
 
     for image_size in image_sizes:
         latent_h = image_size // spatial_downsample
         latent_w = image_size // spatial_downsample
+        total_for_res = max(fid_num_samples, num_samples_per_class * num_classes)
+        latents_list = []
+
+        logger.info(f"Validation: generating {total_for_res} latents at {image_size}x{image_size}...")
+        for i in range(total_for_res):
+            class_idx = i % num_classes
+            latent = _generate_one_sample(
+                unwrapped_model, class_idx, num_classes,
+                latent_h, latent_w, patch_size,
+                num_steps, cfg_scale, dtype, device,
+            )
+            latents_list.append(latent.cpu())
+        all_latents[image_size] = latents_list
+
+    # ── Phase 2: Move NiT to CPU, load VAE, decode and save ────────────────
+    unwrapped_model.cpu()
+    torch.cuda.empty_cache()
+
+    vae = AutoencoderDC.from_pretrained(model_config.vae_dir).to(device, dtype=torch.float32)
+    vae.eval()
+
+    total_saved = 0
+    fid_images_per_res = {}  # {image_size: [numpy_img, ...]}
+
+    for image_size in image_sizes:
         res_label = f"{image_size}x{image_size}"
         res_dir = os.path.join(step_dir, res_label)
         os.makedirs(res_dir, exist_ok=True)
 
-        all_images = []
+        decoded_images = []
+        logger.info(f"Validation: decoding {len(all_latents[image_size])} samples at {res_label}...")
+        for i, latent in enumerate(all_latents[image_size]):
+            img = _decode_latent_to_numpy(vae, latent, device)
+            Image.fromarray(img).save(os.path.join(res_dir, f"{i:05d}.png"))
+            decoded_images.append(img)
+            total_saved += 1
 
-        for class_idx in range(num_classes):
-            n = num_samples_per_class
-
-            # Random latent noise
-            z = torch.randn(
-                n * latent_h * latent_w, unwrapped_model.in_channels, patch_size, patch_size,
-                device=device, dtype=dtype
-            )
-
-            # Class labels
-            y = torch.full((n,), class_idx, device=device, dtype=torch.long)
-
-            # Spatial dimensions
-            hw_list = torch.tensor(
-                [[latent_h, latent_w]] * n, device=device, dtype=torch.int
-            )
-
-            # Null class for CFG
-            y_null = torch.full((n,), num_classes, device=device, dtype=torch.long)
-            samples = _euler_sampler_with_null(
-                unwrapped_model, z, y, y_null, hw_list,
-                num_steps=num_steps, cfg_scale=cfg_scale, dtype=dtype,
-            )
-
-            # Reshape from packed to spatial
-            samples = rearrange(
-                samples.to(torch.float32),
-                '(b h w) c p1 p2 -> b c (h p1) (w p2)',
-                b=n, h=latent_h, w=latent_w,
-            )
-
-            # Decode with VAE
-            images = dc_ae_decode(vae, samples)
-            images = ((images + 1) / 2.0 * 255).clamp(0, 255).to(torch.uint8)
-            images = images.permute(0, 2, 3, 1).cpu().numpy()
-
-            for i, img in enumerate(images):
-                pil_img = Image.fromarray(img)
-                pil_img.save(os.path.join(res_dir, f"class{class_idx:02d}_{i:02d}.png"))
-                all_images.append(img)
-                total_saved += 1
-
-        # Save grid per resolution
-        _save_grid(all_images, num_classes, num_samples_per_class,
+        # Save grid from first num_samples_per_class * num_classes images
+        grid_count = num_samples_per_class * num_classes
+        grid_images = decoded_images[:grid_count]
+        _save_grid(grid_images, num_classes, num_samples_per_class,
                    os.path.join(step_dir, f"grid_{res_label}.png"))
 
-    # Cleanup VAE to free GPU memory
-    del vae
+        fid_images_per_res[image_size] = decoded_images
+
+    del vae, all_latents
     torch.cuda.empty_cache()
 
-    # Restore training mode
+    # ── Phase 3: Compute FID per resolution, move NiT back ──────────────────
+    for image_size in image_sizes:
+        res_label = f"{image_size}x{image_size}"
+        fid_value = _compute_fid(
+            fid_images_per_res[image_size], fid_real_image_dir, device,
+            resize_to=299,
+        )
+        if fid_value is not None:
+            logger.info(f"Validation step {global_steps}: FID-{res_label} = {fid_value:.4f}")
+            accelerator.log({f"fid_{res_label}": fid_value}, step=global_steps)
+
+    del fid_images_per_res
+    torch.cuda.empty_cache()
+
+    # Move NiT back to GPU
+    unwrapped_model.to(device)
+
     if was_training:
         unwrapped_model.train()
 
     logger.info(f"Saved {total_saved} validation images to {step_dir}")
+
+
+def _generate_one_sample(model, class_idx, num_classes, latent_h, latent_w,
+                          patch_size, num_steps, cfg_scale, dtype, device):
+    """Generate one latent sample (before VAE decoding)."""
+    z = torch.randn(
+        latent_h * latent_w, model.in_channels, patch_size, patch_size,
+        device=device, dtype=dtype,
+    )
+    y = torch.tensor([class_idx], device=device, dtype=torch.long)
+    hw_list = torch.tensor([[latent_h, latent_w]], device=device, dtype=torch.int)
+    y_null = torch.tensor([num_classes], device=device, dtype=torch.long)
+
+    sample = _euler_sampler_with_null(
+        model, z, y, y_null, hw_list,
+        num_steps=num_steps, cfg_scale=cfg_scale, dtype=dtype,
+    )
+    return rearrange(
+        sample.to(torch.float32),
+        '(h w) c p1 p2 -> 1 c (h p1) (w p2)',
+        h=latent_h, w=latent_w,
+    )
+
+
+def _decode_latent_to_numpy(vae, latent, device):
+    """Decode a single latent tensor to a uint8 numpy HWC image."""
+    from nit.utils.model_utils import dc_ae_decode
+    img = dc_ae_decode(vae, latent.to(device))
+    img = ((img + 1) / 2.0 * 255).clamp(0, 255).to(torch.uint8)
+    return img[0].permute(1, 2, 0).cpu().numpy()
+
+
+def _compute_fid(generated_images, real_image_dir, device, resize_to=299):
+    """Compute FID between generated images and real images using torchmetrics."""
+    try:
+        from torchmetrics.image.fid import FrechetInceptionDistance
+    except ImportError:
+        logger.warning("torchmetrics not installed, skipping FID. Install with: pip install torchmetrics[image]")
+        return None
+
+    if real_image_dir is None or not os.path.isdir(real_image_dir):
+        logger.warning(f"Real image dir not found: {real_image_dir}, skipping FID.")
+        return None
+
+    from PIL import Image
+    import torchvision.transforms.functional as TF
+
+    fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+
+    # Collect real image paths
+    real_files = sorted([
+        os.path.join(root, f)
+        for root, _, files in os.walk(real_image_dir)
+        for f in files if f.lower().endswith(('.png', '.jpg', '.jpeg'))
+    ])
+    if len(real_files) == 0:
+        logger.warning(f"No images found in {real_image_dir}, skipping FID.")
+        return None
+
+    num_real = min(len(real_files), len(generated_images))
+    batch_size = 32
+
+    # Add real images
+    for i in range(0, num_real, batch_size):
+        batch_files = real_files[i:i + batch_size]
+        batch = []
+        for f in batch_files:
+            img = Image.open(f).convert("RGB").resize((resize_to, resize_to))
+            batch.append(TF.to_tensor(img))
+        batch = torch.stack(batch).to(device)
+        fid.update(batch, real=True)
+
+    # Add generated images
+    for i in range(0, len(generated_images), batch_size):
+        batch_imgs = generated_images[i:i + batch_size]
+        batch = []
+        for img in batch_imgs:
+            pil = Image.fromarray(img).resize((resize_to, resize_to))
+            batch.append(TF.to_tensor(pil))
+        batch = torch.stack(batch).to(device)
+        fid.update(batch, real=False)
+
+    fid_value = fid.compute().item()
+    del fid
+    return fid_value
 
 
 def _euler_sampler_with_null(model, latents, y, y_null, hw_list,
@@ -194,7 +278,6 @@ def _euler_sampler_with_null(model, latents, y, y_null, hw_list,
 def _save_grid(images, num_classes, num_per_class, save_path):
     """Save a grid of images: rows=classes, cols=samples."""
     from PIL import Image as PILImage
-    import numpy as np
 
     if not images:
         return
