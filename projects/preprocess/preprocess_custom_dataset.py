@@ -420,7 +420,7 @@ def main():
         from torch.utils.data import DataLoader as _DataLoader, Dataset as _Dataset
         import concurrent.futures
         radio_dtype = torch.bfloat16
-        RADIO_BATCH_SIZE = 16  # images per forward_pack call
+        RADIO_BATCH_SIZE = 128  # images per forward_pack call
 
         # Filter entries that still need processing
         pending_entries = []
