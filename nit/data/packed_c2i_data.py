@@ -116,7 +116,7 @@ class ImprovedPackedImageNetLatentDataset(Dataset):
 
         # Load precomputed RADIO features if available
         if self.radio_feature_dir is not None:
-            radio_file = os.path.join(self.radio_feature_dir, data_meta['latent_file'])
+            radio_file = os.path.join(self.radio_feature_dir, data_meta['type'], data_meta['latent_file'])
             radio_data = load_file(radio_file)
             data_item['radio_feature'] = radio_data['radio_feature'][rand_idx]
             # Still need image for non-radio uses; use a dummy to save I/O

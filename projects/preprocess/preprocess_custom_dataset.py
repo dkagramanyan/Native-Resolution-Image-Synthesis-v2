@@ -467,7 +467,7 @@ def main():
         pending_entries = []
         radio_skipped = 0
         for entry in all_meta_entries:
-            output_file = os.path.join(radio_feature_dir, entry['latent_file'])
+            output_file = os.path.join(radio_feature_dir, entry['type'], entry['latent_file'])
             if os.path.exists(output_file):
                 radio_skipped += 1
             else:
@@ -520,7 +520,7 @@ def main():
 
                     for i, idx in enumerate(batch_idxs):
                         entry = entries[idx]
-                        output_file = os.path.join(radio_feature_dir, entry['latent_file'])
+                        output_file = os.path.join(radio_feature_dir, entry['type'], entry['latent_file'])
                         radio_feature = torch.stack(
                             [feats_ori_list[i], feats_flip_list[i]], dim=0
                         )
