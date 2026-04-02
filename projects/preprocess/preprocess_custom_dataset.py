@@ -493,6 +493,7 @@ def main():
                     ds, batch_size=RADIO_BATCH_SIZE, shuffle=False,
                     num_workers=4, prefetch_factor=4,
                     collate_fn=_radio_collate, pin_memory=True,
+                    multiprocessing_context='spawn',
                 )
                 encoded = 0
 
