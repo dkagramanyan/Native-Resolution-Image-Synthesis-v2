@@ -267,7 +267,7 @@ def _compute_fid(generated_images, real_image_dir, device, resize_to=299):
     from PIL import Image
     import torchvision.transforms.functional as TF
 
-    fid = FrechetInceptionDistance(feature=2048, normalize=True).to(device)
+    fid = FrechetInceptionDistance(feature=2048, normalize=True, sync_on_compute=False).to(device)
 
     # Collect real image paths
     real_files = sorted([
