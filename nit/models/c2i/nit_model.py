@@ -116,7 +116,7 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x: torch.Tensor, cu_seqlens, freqs_cos, freqs_sin) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cu_seqlens, freqs_cos, freqs_sin, max_seqlen: int = 0) -> torch.Tensor:
         N, C = x.shape
         qkv = self.qkv(x).reshape(N, 3, self.num_heads, self.head_dim).permute(1, 0, 2, 3)
         ori_dtype = qkv.dtype
@@ -127,7 +127,8 @@ class Attention(nn.Module):
         k = k * freqs_cos + rotate_half(k) * freqs_sin
         q, k = q.to(ori_dtype), k.to(ori_dtype)
 
-        max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
+        if max_seqlen <= 0:
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max().item()
 
         if HAS_FLASH_ATTN:
             x = flash_attn_varlen_func(
@@ -228,11 +229,11 @@ class NiTBlock(nn.Module):
                 nn.Linear(hidden_size, 6 * hidden_size, bias=True)
             )
 
-    def forward(self, x, c, cu_seqlens, freqs_cos, freqs_sin):
+    def forward(self, x, c, cu_seqlens, freqs_cos, freqs_sin, max_seqlen: int = 0):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
             self.adaLN_modulation(c).chunk(6, dim=-1)
         )
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), cu_seqlens, freqs_cos, freqs_sin)
+        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa), cu_seqlens, freqs_cos, freqs_sin, max_seqlen)
         x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
 
         return x
@@ -388,25 +389,27 @@ class NiT(nn.Module):
         freqs_cos, freqs_sin = self.get_rope(hw_list)   # (N, D_h)
         seqlens = hw_list[:, 0] * hw_list[:, 1]
         cu_seqlens = torch.cat([
-            torch.tensor([0], device=hw_list.device, dtype=torch.int), 
+            torch.tensor([0], device=hw_list.device, dtype=torch.int),
             torch.cumsum(seqlens, dim=0, dtype=torch.int)
         ])
+        # Precompute max_seqlen once to avoid repeated .item() calls in every block
+        max_seqlen = seqlens.max().item()
 
         # timestep and class embedding
         t_embed = self.t_embedder(t)            # (B, D)
         y = self.y_embedder(y)                  # (B, D)
         c = t_embed + y                         # (B, D)
-        
-        # (B, D) -> (N, D)
-        c = torch.cat([c[i].unsqueeze(0).repeat(seqlens[i], 1) for i in range(B)], dim=0)
-        
+
+        # (B, D) -> (N, D) - use repeat_interleave for efficiency
+        c = torch.repeat_interleave(c, seqlens, dim=0)
+
         zs=[]
         for i, block in enumerate(self.blocks):
             if not self.use_checkpoint:
-                x = block(x, c, cu_seqlens, freqs_cos, freqs_sin)   # (N, D)
+                x = block(x, c, cu_seqlens, freqs_cos, freqs_sin, max_seqlen)   # (N, D)
             else:
                 x = torch.utils.checkpoint.checkpoint(
-                    self.ckpt_wrapper(block), x, c, cu_seqlens, freqs_cos, freqs_sin,
+                    self.ckpt_wrapper(block), x, c, cu_seqlens, freqs_cos, freqs_sin, max_seqlen,
                     use_reentrant=False,
                 )  
             if (i + 1) == self.encoder_depth and return_zs:
