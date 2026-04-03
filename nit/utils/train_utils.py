@@ -152,7 +152,7 @@ def log_validation(
     torch.cuda.empty_cache()
     accelerator.wait_for_everyone()
 
-    vae = AutoencoderDC.from_pretrained(model_config.vae_dir).to(device, dtype=torch.float32)
+    vae = AutoencoderDC.from_pretrained(model_config.vae_dir, local_files_only=True).to(device, dtype=torch.float32)
     vae.eval()
 
     for image_size in image_sizes:
