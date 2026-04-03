@@ -30,6 +30,8 @@ REQUIRED_PACKAGES = [
     ("tqdm", "tqdm", "progress bars"),
     ("packaging", "packaging", "version checks"),
     ("triton", "triton", "flash attention backend"),
+    ("torchmetrics", "torchmetrics[image]", "FID validation"),
+    ("torch_fidelity", "torch-fidelity", "FID validation"),
 ]
 
 # ── Required models ───────────────────────────────────────────────────────────
@@ -44,6 +46,12 @@ MODELS = [
         "name": "DC-AE VAE (image encoder for latent preprocessing)",
         "hf_model_id": "mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers",
         "required_for": "preprocessing",
+    },
+    {
+        "name": "InceptionV3 (torch-fidelity, for FID validation)",
+        "torch_hub_url": "https://github.com/toshas/torch-fidelity/releases/download/v0.2.0/weights-inception-2015-12-05-6726825d.pth",
+        "cache_file": "weights-inception-2015-12-05-6726825d.pth",
+        "required_for": "FID validation",
     },
 ]
 
@@ -130,6 +138,33 @@ def check_models(download=True):
                         print(f"  [OK]   Downloaded successfully.")
                     else:
                         print(f"  [FAIL] Download FAILED.")
+                        all_ok = False
+                else:
+                    all_ok = False
+
+        elif "torch_hub_url" in model:
+            # Torch hub cached model (e.g. InceptionV3 for FID)
+            cache_dir = os.path.join(
+                os.path.expanduser("~"), ".cache", "torch", "hub", "checkpoints"
+            )
+            cached_path = os.path.join(cache_dir, model["cache_file"])
+            exists = os.path.isfile(cached_path)
+
+            if exists:
+                print(f"  [OK]   {model['name']}")
+                print(f"         Cache: {cached_path}")
+            else:
+                print(f"  [MISS] {model['name']}")
+                print(f"         Cache: {cached_path}")
+                if download:
+                    print(f"         Downloading...")
+                    os.makedirs(cache_dir, exist_ok=True)
+                    try:
+                        from torch.hub import download_url_to_file
+                        download_url_to_file(model["torch_hub_url"], cached_path)
+                        print(f"  [OK]   Downloaded successfully.")
+                    except Exception as e:
+                        print(f"  [FAIL] Download FAILED: {e}")
                         all_ok = False
                 else:
                     all_ok = False
