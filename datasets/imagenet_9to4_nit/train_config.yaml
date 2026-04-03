@@ -16,7 +16,7 @@ model:
       qk_norm: true
       encoder_depth: 8
       z_dim: 1280
-      use_checkpoint: false
+      use_checkpoint: true
       use_adaln_lora: true
       adaln_lora_dim: 512
   vae_dir: mit-han-lab/dc-ae-f32c32-sana-1.1-diffusers
@@ -45,7 +45,7 @@ data:
     radio_feature_dir: datasets/imagenet_9to4_nit/radio-features
   dataloader:
     num_workers: 8
-    batch_size: 64
+    batch_size: 2
 
 training:
   tracker: tensorboard
