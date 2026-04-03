@@ -2,8 +2,8 @@
 Check that all dependencies are installed and download required models.
 
 Usage:
-    python check_environment.py              # check everything
-    python check_environment.py --download   # also download models
+    python check_environment.py              # check everything and download models
+    python check_environment.py --no-download # only check, do not download
 """
 
 import sys
@@ -11,6 +11,8 @@ import argparse
 import importlib
 import os
 import subprocess
+import urllib.request
+import shutil
 
 
 # ── Required Python packages ──────────────────────────────────────────────────
@@ -49,11 +51,27 @@ MODELS = [
     },
     {
         "name": "InceptionV3 (torch-fidelity, for FID validation)",
-        "torch_hub_url": "https://github.com/toshas/torch-fidelity/releases/download/v0.2.0/weights-inception-2015-12-05-6726825d.pth",
+        "url": "https://github.com/toshas/torch-fidelity/releases/download/v0.2.0/weights-inception-2015-12-05-6726825d.pth",
+        "cache_dir": os.path.join(os.path.expanduser("~"), ".cache", "torch", "hub", "checkpoints"),
         "cache_file": "weights-inception-2015-12-05-6726825d.pth",
         "required_for": "FID validation",
     },
 ]
+
+
+def _download_file(url, dest):
+    """Download a file using wget (preferred) or urllib as fallback."""
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if shutil.which("wget"):
+        result = subprocess.run(["wget", "-c", url, "-O", dest])
+        return result.returncode == 0 and os.path.isfile(dest)
+    else:
+        try:
+            urllib.request.urlretrieve(url, dest)
+            return os.path.isfile(dest)
+        except Exception as e:
+            print(f"         urllib error: {e}")
+            return False
 
 
 def check_packages():
@@ -106,7 +124,7 @@ def check_torch_details():
         else:
             print("  WARNING: No CUDA GPU detected. Training requires GPU.")
     except ImportError:
-        print("  PyTorch not installed.")
+        print("  PyTorch not installed — skipping.")
     print()
 
 
@@ -119,7 +137,7 @@ def check_models(download=True):
 
     for model in MODELS:
         if "path" in model:
-            # File-based model (RADIO)
+            # File-based model with direct URL (e.g. RADIO)
             exists = os.path.isfile(model["path"])
 
             if exists:
@@ -130,11 +148,7 @@ def check_models(download=True):
                 print(f"         Path: {model['path']}")
                 if download:
                     print(f"         Downloading...")
-                    os.makedirs(os.path.dirname(model["path"]), exist_ok=True)
-                    result = subprocess.run(
-                        ["wget", "-c", model["url"], "-O", model["path"]]
-                    )
-                    if result.returncode == 0 and os.path.isfile(model["path"]):
+                    if _download_file(model["url"], model["path"]):
                         print(f"  [OK]   Downloaded successfully.")
                     else:
                         print(f"  [FAIL] Download FAILED.")
@@ -142,12 +156,9 @@ def check_models(download=True):
                 else:
                     all_ok = False
 
-        elif "torch_hub_url" in model:
-            # Torch hub cached model (e.g. InceptionV3 for FID)
-            cache_dir = os.path.join(
-                os.path.expanduser("~"), ".cache", "torch", "hub", "checkpoints"
-            )
-            cached_path = os.path.join(cache_dir, model["cache_file"])
+        elif "cache_file" in model:
+            # Cached model downloaded by URL (e.g. InceptionV3 for FID)
+            cached_path = os.path.join(model["cache_dir"], model["cache_file"])
             exists = os.path.isfile(cached_path)
 
             if exists:
@@ -158,20 +169,16 @@ def check_models(download=True):
                 print(f"         Cache: {cached_path}")
                 if download:
                     print(f"         Downloading...")
-                    os.makedirs(cache_dir, exist_ok=True)
-                    try:
-                        from torch.hub import download_url_to_file
-                        download_url_to_file(model["torch_hub_url"], cached_path)
+                    if _download_file(model["url"], cached_path):
                         print(f"  [OK]   Downloaded successfully.")
-                    except Exception as e:
-                        print(f"  [FAIL] Download FAILED: {e}")
+                    else:
+                        print(f"  [FAIL] Download FAILED.")
                         all_ok = False
                 else:
                     all_ok = False
 
         elif "hf_model_id" in model:
             # HuggingFace model (DC-AE)
-            cached = False
             hf_cache = os.path.expanduser("~/.cache/huggingface/hub")
             model_cache_name = "models--" + model["hf_model_id"].replace("/", "--")
             cached = os.path.isdir(os.path.join(hf_cache, model_cache_name))
@@ -185,9 +192,20 @@ def check_models(download=True):
                 if download:
                     print(f"         Downloading from HuggingFace...")
                     try:
-                        from diffusers import AutoencoderDC
-                        AutoencoderDC.from_pretrained(model["hf_model_id"])
+                        from huggingface_hub import snapshot_download
+                        snapshot_download(model["hf_model_id"])
                         print(f"  [OK]   Downloaded and cached successfully.")
+                    except ImportError:
+                        try:
+                            from diffusers import AutoencoderDC
+                            AutoencoderDC.from_pretrained(model["hf_model_id"])
+                            print(f"  [OK]   Downloaded and cached successfully.")
+                        except ImportError:
+                            print(f"  [FAIL] Cannot download: install huggingface_hub or diffusers first.")
+                            all_ok = False
+                        except Exception as e:
+                            print(f"  [FAIL] Download FAILED: {e}")
+                            all_ok = False
                     except Exception as e:
                         print(f"  [FAIL] Download FAILED: {e}")
                         all_ok = False
@@ -256,18 +274,22 @@ def main():
     print("=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    all_ok = pkg_ok and nit_ok and models_ok
-    if all_ok:
-        print("  Everything is ready. You can start preprocessing and training.")
+    if not pkg_ok:
+        print("  [WARN] Some Python packages are missing (see above).")
+    if not nit_ok:
+        print("  [WARN] NiT package or submodules not importable.")
+    if models_ok:
+        print("  [OK]   All models downloaded and ready.")
     else:
-        if not pkg_ok:
-            print("  - Some Python packages are missing.")
-        if not nit_ok:
-            print("  - NiT package or submodules not importable.")
-        if not models_ok:
-            print("  - Some models are missing.")
+        print("  [FAIL] Some models are missing.")
+
+    if pkg_ok and nit_ok and models_ok:
+        print("  Everything is ready. You can start preprocessing and training.")
+
     print()
-    sys.exit(0 if all_ok else 1)
+    # Exit with error only if models failed to download —
+    # missing packages are just a warning (they may be available on compute nodes).
+    sys.exit(0 if models_ok else 1)
 
 
 if __name__ == "__main__":
