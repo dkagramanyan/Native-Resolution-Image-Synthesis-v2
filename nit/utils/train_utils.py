@@ -148,7 +148,12 @@ def log_validation(
         all_latents[image_size] = reordered
 
     # ── Phase 2: Decode with VAE (distributed, save to disk) ───────────────
-    unwrapped_model.cpu()
+    # Move parameter data to CPU *in-place* to preserve Parameter objects
+    # (using .cpu()/.to() on a Module creates new Parameters, breaking DDP hooks)
+    for p in unwrapped_model.parameters():
+        p.data = p.data.cpu()
+        if p.grad is not None:
+            p.grad = p.grad.cpu()
     torch.cuda.empty_cache()
     accelerator.wait_for_everyone()
 
@@ -202,7 +207,8 @@ def log_validation(
 
     # ── Cleanup: move NiT back to GPU ──────────────────────────────────────
     torch.cuda.empty_cache()
-    unwrapped_model.to(device)
+    for p in unwrapped_model.parameters():
+        p.data = p.data.to(device)
     if was_training:
         unwrapped_model.train()
     accelerator.wait_for_everyone()
