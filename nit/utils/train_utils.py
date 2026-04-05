@@ -148,13 +148,8 @@ def log_validation(
         all_latents[image_size] = reordered
 
     # ── Phase 2: Decode with VAE (distributed, save to disk) ───────────────
-    # Move parameter data to CPU *in-place* to preserve Parameter objects
-    # (using .cpu()/.to() on a Module creates new Parameters, breaking DDP hooks)
-    for p in unwrapped_model.parameters():
-        p.data = p.data.cpu()
-        if p.grad is not None:
-            p.grad = p.grad.cpu()
-    torch.cuda.empty_cache()
+    # Keep model on GPU to avoid breaking DDP hooks and torch.compile cached graphs.
+    # VAE is small enough to coexist in memory.
     accelerator.wait_for_everyone()
 
     vae = AutoencoderDC.from_pretrained(model_config.vae_dir, local_files_only=True).to(device, dtype=torch.float32)
@@ -205,10 +200,8 @@ def log_validation(
 
         logger.info(f"Saved {total_saved} validation images to {step_dir}")
 
-    # ── Cleanup: move NiT back to GPU ──────────────────────────────────────
+    # ── Cleanup ──────────────────────────────────────────────────────────────
     torch.cuda.empty_cache()
-    for p in unwrapped_model.parameters():
-        p.data = p.data.to(device)
     if was_training:
         unwrapped_model.train()
     accelerator.wait_for_everyone()

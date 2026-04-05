@@ -472,16 +472,18 @@ def main(args):
                 save_path = osp.join(checkpoint_dir, f"checkpoint-{global_steps}")
                 if accelerator.is_main_process:
                     os.makedirs(save_path, exist_ok=True)
-                    accelerator.save_state(save_path)
+                accelerator.wait_for_everyone()
+                accelerator.save_state(save_path)
+                if accelerator.is_main_process:
                     logger.info(f"Saved state to {save_path}")
-
-                
 
                 if global_steps in train_config.checkpoint_list:
                     save_path = os.path.join(checkpoint_dir, f"save-checkpoint-{global_steps}")
                     if accelerator.is_main_process:
                         os.makedirs(save_path, exist_ok=True)
-                        accelerator.save_state(save_path)
+                    accelerator.wait_for_everyone()
+                    accelerator.save_state(save_path)
+                    if accelerator.is_main_process:
                         logger.info(f"Saved state to {save_path}")
 
                 time.sleep(10)
